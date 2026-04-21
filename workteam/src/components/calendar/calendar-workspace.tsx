@@ -56,12 +56,66 @@ function moveEventToNewDay(ev: CalendarEvent, targetDay: dayjs.Dayjs): { startsA
   return { startsAt: ns.toISOString(), endsAt: ne.toISOString() };
 }
 
+/** 해당 날짜 기준 분 단위 구간 (0–1440) */
+function clampDayMinutes(ev: CalendarEvent, day: dayjs.Dayjs): { startMin: number; endMin: number } {
+  const d0 = day.startOf("day");
+  const startMin = Math.max(0, dayjs(ev.startsAt).diff(d0, "minute"));
+  const endMin = Math.min(24 * 60, dayjs(ev.endsAt).diff(d0, "minute"));
+  return { startMin, endMin };
+}
+
+function eventsOverlapMinutes(a: CalendarEvent, b: CalendarEvent, day: dayjs.Dayjs): boolean {
+  const ca = clampDayMinutes(a, day);
+  const cb = clampDayMinutes(b, day);
+  return ca.startMin < cb.endMin && cb.startMin < ca.endMin;
+}
+
+/** 겹치는 일정을 열로 나누어 가독성 있게 배치 (그리디 열 배정 + 겹침 구간별 열 수) */
+function layoutTimedEventsStack(events: CalendarEvent[], day: dayjs.Dayjs): Map<string, { col: number; colCount: number }> {
+  const sorted = [...events].sort((a, b) => {
+    const s = dayjs(a.startsAt).valueOf() - dayjs(b.startsAt).valueOf();
+    if (s !== 0) return s;
+    return dayjs(a.endsAt).valueOf() - dayjs(b.endsAt).valueOf();
+  });
+  const colEndMin: number[] = [];
+  const assignedCol = new Map<string, number>();
+
+  for (const ev of sorted) {
+    const { startMin, endMin } = clampDayMinutes(ev, day);
+    let col = -1;
+    for (let c = 0; c < colEndMin.length; c++) {
+      if (colEndMin[c] <= startMin) {
+        col = c;
+        break;
+      }
+    }
+    if (col === -1) {
+      col = colEndMin.length;
+      colEndMin.push(endMin);
+    } else {
+      colEndMin[col] = endMin;
+    }
+    assignedCol.set(ev.id, col);
+  }
+
+  const out = new Map<string, { col: number; colCount: number }>();
+  for (const ev of sorted) {
+    const col = assignedCol.get(ev.id)!;
+    const overlaps = sorted.filter((f) => eventsOverlapMinutes(ev, f, day));
+    const maxCol = Math.max(...overlaps.map((f) => assignedCol.get(f.id)!));
+    const colCount = maxCol + 1;
+    out.set(ev.id, { col, colCount });
+  }
+  return out;
+}
+
 function DraggableEventChip({
   event: ev,
   compact,
   onClick
 }: {
   event: CalendarEvent;
+  /** 월간 그리드: 한 줄·truncate. 일/주 시간축: 줄바꿈·겹침 열 대응 */
   compact?: boolean;
   onClick: (e: CalendarEvent) => void;
 }) {
@@ -86,14 +140,25 @@ function DraggableEventChip({
         onClick(ev);
       }}
       className={clsx(
-        "w-full rounded border border-black/[0.06] px-1.5 py-0.5 text-left text-xs font-medium shadow-sm transition hover:brightness-[0.98]",
+        "w-full min-w-0 rounded border border-black/[0.06] px-1.5 py-0.5 text-left text-xs font-medium shadow-sm transition hover:brightness-[0.98]",
         kindStyle(ev.kind),
-        compact ? "truncate leading-tight" : "py-1",
+        compact ? "truncate leading-tight" : "flex min-h-[28px] flex-col gap-0.5 py-1 whitespace-normal break-words [overflow-wrap:anywhere]",
         isDragging && "opacity-40"
       )}
     >
-      {!compact && <span className="mr-1 text-[10px] opacity-70">{KIND_LABEL[ev.kind]}</span>}
-      {dayjs(ev.startsAt).format("HH:mm")} {ev.title}
+      {compact ? (
+        <>
+          {dayjs(ev.startsAt).format("HH:mm")} {ev.title}
+        </>
+      ) : (
+        <>
+          <span className="text-[10px] leading-none opacity-70">{KIND_LABEL[ev.kind]}</span>
+          <span className="shrink-0 text-[10px] tabular-nums leading-none opacity-80">
+            {dayjs(ev.startsAt).format("HH:mm")} – {dayjs(ev.endsAt).format("HH:mm")}
+          </span>
+          <span className="min-w-0 text-xs font-semibold leading-snug">{ev.title}</span>
+        </>
+      )}
     </button>
   );
 }
@@ -499,9 +564,10 @@ export function CalendarWorkspace() {
                   const key = d.format("YYYY-MM-DD");
                   const today = d.isSame(dayjs(), "day");
                   const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, d));
+                  const stackMap = layoutTimedEventsStack(dayEvents, d);
                   return (
                     <DroppableDayCell key={key} dayKey={key} isToday={today} muted={false}>
-                      <div className="relative min-h-[1152px]">
+                      <div className="relative min-h-[1152px] min-w-[120px]">
                         {Array.from({ length: 24 }, (_, h) => (
                           <div key={h} className="h-12 border-b border-slate-100" />
                         ))}
@@ -514,11 +580,21 @@ export function CalendarWorkspace() {
                           const hpx = 48;
                           const top = (topMin / 60) * hpx;
                           const height = Math.max(24, ((endMin - topMin) / 60) * hpx);
+                          const stack = stackMap.get(ev.id)!;
+                          const leftPct = (stack.col / stack.colCount) * 100;
+                          const widthPct = 100 / stack.colCount;
                           return (
                             <div
                               key={ev.id}
-                              className="absolute left-0 right-0 px-0.5"
-                              style={{ top, height, minHeight: 28 }}
+                              className="absolute box-border px-0.5"
+                              style={{
+                                top,
+                                height,
+                                minHeight: 28,
+                                left: `${leftPct}%`,
+                                width: `${widthPct}%`,
+                                right: "auto"
+                              }}
                             >
                               <DraggableEventChip event={ev} onClick={setDetail} />
                             </div>
@@ -533,7 +609,7 @@ export function CalendarWorkspace() {
           )}
 
           {!eventsQuery.isLoading && view === "day" && (
-            <div className="min-w-[360px]">
+            <div className="min-w-[min(100%,480px)]">
               <div
                 className={clsx(
                   "border-b border-slate-200 px-4 py-3 text-center",
@@ -542,7 +618,7 @@ export function CalendarWorkspace() {
               >
                 <span className="text-sm font-semibold text-slate-800">{cursor.format("YYYY년 M월 D일 dddd")}</span>
               </div>
-              <div className="flex">
+              <div className="flex min-w-0">
                 <div className="w-12 shrink-0 border-r border-slate-200 bg-slate-50/50 py-1 text-right text-[10px] text-slate-400">
                   {Array.from({ length: 24 }, (_, h) => (
                     <div key={h} className="h-14 pr-1 leading-[56px]">
@@ -550,18 +626,20 @@ export function CalendarWorkspace() {
                     </div>
                   ))}
                 </div>
+                <div className="min-w-0 flex-1">
                 <DroppableDayCell
                   dayKey={cursor.format("YYYY-MM-DD")}
                   isToday={cursor.isSame(dayjs(), "day")}
                   muted={false}
                 >
-                  <div className="relative min-h-[1344px]">
+                  <div className="relative min-h-[1344px] w-full min-w-[280px]">
                     {Array.from({ length: 24 }, (_, h) => (
                       <div key={h} className="h-14 border-b border-slate-100" />
                     ))}
-                    {displayEvents
-                      .filter((ev) => eventTouchesDay(ev, cursor))
-                      .map((ev) => {
+                    {(() => {
+                      const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, cursor));
+                      const stackMap = layoutTimedEventsStack(dayEvents, cursor);
+                      return dayEvents.map((ev) => {
                         const start = dayjs(ev.startsAt);
                         const end = dayjs(ev.endsAt);
                         const dayStart = cursor.startOf("day");
@@ -570,18 +648,30 @@ export function CalendarWorkspace() {
                         const hpx = 56;
                         const top = (topMin / 60) * hpx;
                         const height = Math.max(28, ((endMin - topMin) / 60) * hpx);
+                        const stack = stackMap.get(ev.id)!;
+                        const leftPct = (stack.col / stack.colCount) * 100;
+                        const widthPct = 100 / stack.colCount;
                         return (
                           <div
                             key={ev.id}
-                            className="absolute left-0 right-0 px-1"
-                            style={{ top, height }}
+                            className="absolute box-border px-1"
+                            style={{
+                              top,
+                              height,
+                              minHeight: 28,
+                              left: `${leftPct}%`,
+                              width: `${widthPct}%`,
+                              right: "auto"
+                            }}
                           >
                             <DraggableEventChip event={ev} onClick={setDetail} />
                           </div>
                         );
-                      })}
+                      });
+                    })()}
                   </div>
                 </DroppableDayCell>
+                </div>
               </div>
             </div>
           )}

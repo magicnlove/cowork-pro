@@ -162,7 +162,14 @@ function TreeNodes({
   open,
   toggle,
   onDeleteDepartment,
-  deletingDepartmentId
+  deletingDepartmentId,
+  editingDepartmentId,
+  deptNameDraft,
+  onStartEditDepartment,
+  onDeptNameDraftChange,
+  onSaveDepartmentName,
+  onCancelEditDepartment,
+  patchDepartmentPending
 }: {
   parentId: string | null;
   depth: number;
@@ -171,6 +178,13 @@ function TreeNodes({
   toggle: (id: string) => void;
   onDeleteDepartment: (dept: Dept, hasChildren: boolean) => void;
   deletingDepartmentId: string | null;
+  editingDepartmentId: string | null;
+  deptNameDraft: string;
+  onStartEditDepartment: (dept: Dept) => void;
+  onDeptNameDraftChange: (name: string) => void;
+  onSaveDepartmentName: () => void;
+  onCancelEditDepartment: () => void;
+  patchDepartmentPending: boolean;
 }) {
   const list = childrenMap.get(parentId) ?? [];
   return (
@@ -179,31 +193,83 @@ function TreeNodes({
         const kids = childrenMap.get(d.id) ?? [];
         const hasKids = kids.length > 0;
         const isOpen = open.has(d.id);
+        const isEditing = editingDepartmentId === d.id;
         return (
           <li key={d.id} className="py-0.5 text-sm">
-            <div className="flex items-center gap-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
               {hasKids ? (
                 <button
                   type="button"
-                  className="w-5 text-xs text-slate-500"
+                  className="w-5 shrink-0 text-xs text-slate-500"
                   onClick={() => toggle(d.id)}
                   aria-expanded={isOpen}
                 >
                   {isOpen ? "▼" : "▶"}
                 </button>
               ) : (
-                <span className="w-5" />
+                <span className="w-5 shrink-0" />
               )}
-              <span className="font-medium text-slate-800">{d.name}</span>
-              <span className="text-xs text-slate-400">{d.code}</span>
-              <button
-                type="button"
-                disabled={Boolean(deletingDepartmentId)}
-                className="ml-1 rounded border border-rose-200 px-1.5 py-0.5 text-[11px] text-rose-600 hover:bg-rose-50 disabled:opacity-50"
-                onClick={() => onDeleteDepartment(d, hasKids)}
-              >
-                {deletingDepartmentId === d.id ? "삭제 중…" : "삭제"}
-              </button>
+              {isEditing ? (
+                <>
+                  <input
+                    type="text"
+                    className="min-w-[8rem] max-w-full flex-1 rounded border border-slate-200 px-2 py-0.5 text-sm font-medium text-slate-800"
+                    value={deptNameDraft}
+                    onChange={(e) => onDeptNameDraftChange(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        onSaveDepartmentName();
+                      }
+                      if (e.key === "Escape") {
+                        e.preventDefault();
+                        onCancelEditDepartment();
+                      }
+                    }}
+                    autoFocus
+                    disabled={patchDepartmentPending}
+                    maxLength={200}
+                    aria-label="부서 이름"
+                  />
+                  <button
+                    type="button"
+                    disabled={patchDepartmentPending}
+                    className="shrink-0 rounded border border-brand-200 px-1.5 py-0.5 text-[11px] text-brand-700 hover:bg-brand-50 disabled:opacity-50"
+                    onClick={onSaveDepartmentName}
+                  >
+                    {patchDepartmentPending ? "저장 중…" : "저장"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={patchDepartmentPending}
+                    className="shrink-0 rounded border border-slate-200 px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+                    onClick={onCancelEditDepartment}
+                  >
+                    취소
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span className="min-w-0 font-medium text-slate-800">{d.name}</span>
+                  <span className="shrink-0 text-xs text-slate-400">{d.code}</span>
+                  <button
+                    type="button"
+                    disabled={Boolean(deletingDepartmentId) || patchDepartmentPending}
+                    className="shrink-0 rounded border border-slate-200 px-1.5 py-0.5 text-[11px] text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+                    onClick={() => onStartEditDepartment(d)}
+                  >
+                    수정
+                  </button>
+                  <button
+                    type="button"
+                    disabled={Boolean(deletingDepartmentId) || patchDepartmentPending}
+                    className="shrink-0 rounded border border-rose-200 px-1.5 py-0.5 text-[11px] text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+                    onClick={() => onDeleteDepartment(d, hasKids)}
+                  >
+                    {deletingDepartmentId === d.id ? "삭제 중…" : "삭제"}
+                  </button>
+                </>
+              )}
             </div>
             {hasKids && isOpen ? (
               <TreeNodes
@@ -214,6 +280,13 @@ function TreeNodes({
                 toggle={toggle}
                 onDeleteDepartment={onDeleteDepartment}
                 deletingDepartmentId={deletingDepartmentId}
+                editingDepartmentId={editingDepartmentId}
+                deptNameDraft={deptNameDraft}
+                onStartEditDepartment={onStartEditDepartment}
+                onDeptNameDraftChange={onDeptNameDraftChange}
+                onSaveDepartmentName={onSaveDepartmentName}
+                onCancelEditDepartment={onCancelEditDepartment}
+                patchDepartmentPending={patchDepartmentPending}
               />
             ) : null}
           </li>
@@ -402,6 +475,8 @@ export function AdminWorkspace() {
     departmentAssignments: [] as DepartmentAssignmentInput[]
   });
   const [deletingDepartmentId, setDeletingDepartmentId] = useState<string | null>(null);
+  const [editingDepartmentId, setEditingDepartmentId] = useState<string | null>(null);
+  const [deptNameDraft, setDeptNameDraft] = useState("");
   const [deletingUserId, setDeletingUserId] = useState<string | null>(null);
   const [tempPasswordModal, setTempPasswordModal] = useState<TempPasswordResult | null>(null);
   const [passwordCopyDone, setPasswordCopyDone] = useState(false);
@@ -484,6 +559,22 @@ export function AdminWorkspace() {
       qc.invalidateQueries({ queryKey: ["admin-departments"] });
       qc.invalidateQueries({ queryKey: ["departments"] });
       qc.invalidateQueries({ queryKey: ["admin-users"] });
+    }
+  });
+
+  const patchDepartment = useMutation({
+    mutationFn: (p: { id: string; body: { name: string } }) =>
+      fetchJson(`/api/admin/departments/${p.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(p.body)
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["admin-departments"] });
+      qc.invalidateQueries({ queryKey: ["departments"] });
+      qc.invalidateQueries({ queryKey: ["admin-users"] });
+      setEditingDepartmentId(null);
+      setDeptNameDraft("");
     }
   });
 
@@ -672,6 +763,33 @@ export function AdminWorkspace() {
     }
   }
 
+  function handleStartEditDepartment(dept: Dept) {
+    setEditingDepartmentId(dept.id);
+    setDeptNameDraft(dept.name);
+  }
+
+  function handleCancelEditDepartment() {
+    setEditingDepartmentId(null);
+    setDeptNameDraft("");
+  }
+
+  async function handleSaveDepartmentName() {
+    const name = deptNameDraft.trim();
+    if (!name) {
+      window.alert("부서 이름을 입력해 주세요.");
+      return;
+    }
+    if (!editingDepartmentId) {
+      return;
+    }
+    try {
+      await patchDepartment.mutateAsync({ id: editingDepartmentId, body: { name } });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "부서 이름을 수정하지 못했습니다.";
+      window.alert(message);
+    }
+  }
+
   async function handleDeleteUser(user: AdminUser) {
     if (user.role === "admin") {
       window.alert("admin 계정은 삭제할 수 없습니다.");
@@ -799,6 +917,13 @@ export function AdminWorkspace() {
               toggle={toggle}
               onDeleteDepartment={handleDeleteDepartment}
               deletingDepartmentId={deletingDepartmentId}
+              editingDepartmentId={editingDepartmentId}
+              deptNameDraft={deptNameDraft}
+              onStartEditDepartment={handleStartEditDepartment}
+              onDeptNameDraftChange={setDeptNameDraft}
+              onSaveDepartmentName={handleSaveDepartmentName}
+              onCancelEditDepartment={handleCancelEditDepartment}
+              patchDepartmentPending={patchDepartment.isPending}
             />
           )}
         </div>

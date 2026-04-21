@@ -1,0 +1,13 @@
+BEGIN;
+CREATE TEMP TABLE _target_users ON COMMIT DROP AS SELECT u.id, u.email FROM users u WHERE u.email IN ('admin@company.com', 'member@company.com');
+CREATE TEMP TABLE _target_channels ON COMMIT DROP AS SELECT c.id FROM channels c WHERE c.created_by IN (SELECT id FROM _target_users) OR c.dm_user_a_id IN (SELECT id FROM _target_users) OR c.dm_user_b_id IN (SELECT id FROM _target_users);
+CREATE TEMP TABLE _target_messages ON COMMIT DROP AS SELECT m.id FROM messages m WHERE m.user_id IN (SELECT id FROM _target_users) OR m.channel_id IN (SELECT id FROM _target_channels);
+DELETE FROM file_attachments WHERE uploaded_by IN (SELECT id FROM _target_users);
+DELETE FROM messages WHERE id IN (SELECT id FROM _target_messages);
+DELETE FROM channels WHERE id IN (SELECT id FROM _target_channels);
+DELETE FROM meeting_notes WHERE created_by IN (SELECT id FROM _target_users);
+DELETE FROM tasks WHERE created_by IN (SELECT id FROM _target_users);
+DELETE FROM events WHERE created_by IN (SELECT id FROM _target_users);
+DELETE FROM workspaces WHERE created_by IN (SELECT id FROM _target_users);
+DELETE FROM users WHERE id IN (SELECT id FROM _target_users);
+COMMIT;

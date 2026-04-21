@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 import { getRecentModifiedDocuments, getWorkspaceCardSummaries } from "@/lib/archive-queries";
 import { getSessionFromRequest } from "@/lib/session";

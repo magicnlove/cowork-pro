@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 import * as XLSX from "xlsx";
 import { denyUnlessAdmin } from "@/lib/require-admin";

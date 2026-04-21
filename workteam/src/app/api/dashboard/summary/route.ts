@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 import { getRecentModifiedDocuments } from "@/lib/archive-queries";
 import { db } from "@/lib/db";

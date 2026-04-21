@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 import { broadcastNavBadgesRefresh } from "@/lib/activity-socket-broadcast";
 import { db } from "@/lib/db";

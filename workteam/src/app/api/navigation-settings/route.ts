@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 import { mergeNavVisibility } from "@/lib/navigation-settings";
 import { db } from "@/lib/db";

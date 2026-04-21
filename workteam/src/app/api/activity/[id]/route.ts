@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 import { canUserDeleteActivityLog, canUserViewActivityLog } from "@/lib/activity-scope";
 import { db } from "@/lib/db";

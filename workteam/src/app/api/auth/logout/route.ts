@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextResponse } from "next/server";
 import { authCookieOptions, passwordChangeRequiredCookieOptions } from "@/lib/auth";
 import { AUTH_TOKEN_COOKIE, PASSWORD_CHANGE_REQUIRED_COOKIE } from "@/lib/cookie-names";

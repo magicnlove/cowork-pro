@@ -15,7 +15,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import dayjs from "dayjs";
 import isoWeek from "dayjs/plugin/isoWeek";
-import { ReactNode, useEffect, useMemo, useState } from "react";
+import { ReactNode, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { fetchJson } from "@/lib/fetch-json";
 import { markNavBadgeRead } from "@/lib/nav-badge-read";
 import type { UserOption } from "@/types/tasks";
@@ -45,6 +45,14 @@ function eventTouchesDay(ev: CalendarEvent, day: dayjs.Dayjs): boolean {
   const d0 = day.startOf("day");
   const d1 = day.endOf("day");
   return dayjs(ev.startsAt).isBefore(d1) && dayjs(ev.endsAt).isAfter(d0);
+}
+
+/** 월 그리드: 포인터 아래의 `data-month-day`(YYYY-MM-DD) 셀 키 */
+function monthDayKeyFromPoint(clientX: number, clientY: number): string | null {
+  const el = document.elementFromPoint(clientX, clientY);
+  if (!el || !(el instanceof Element)) return null;
+  const hit = el.closest("[data-month-day]");
+  return hit?.getAttribute("data-month-day") ?? null;
 }
 
 function moveEventToNewDay(ev: CalendarEvent, targetDay: dayjs.Dayjs): { startsAt: string; endsAt: string } {
@@ -140,7 +148,7 @@ function DraggableEventChip({
         onClick(ev);
       }}
       className={clsx(
-        "w-full min-w-0 rounded border border-black/[0.06] px-1.5 py-0.5 text-left text-xs font-medium shadow-sm transition hover:brightness-[0.98]",
+        "pointer-events-auto w-full min-w-0 rounded border border-black/[0.06] px-1.5 py-0.5 text-left text-xs font-medium shadow-sm transition hover:brightness-[0.98]",
         kindStyle(ev.kind),
         compact ? "truncate leading-tight" : "flex min-h-[28px] flex-col gap-0.5 py-1 whitespace-normal break-words [overflow-wrap:anywhere]",
         isDragging && "opacity-40"
@@ -167,11 +175,14 @@ function DroppableDayCell({
   dayKey,
   isToday,
   muted,
+  rangeHighlight,
   children
 }: {
   dayKey: string;
   isToday: boolean;
   muted: boolean;
+  /** 월 뷰: 날짜 범위 드래그 중 선택 구간 하이라이트 */
+  rangeHighlight?: boolean;
   children: ReactNode;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: `day-${dayKey}` });
@@ -182,10 +193,358 @@ function DroppableDayCell({
         "min-h-[92px] border-b border-r border-slate-200/90 bg-white p-1",
         muted && "bg-slate-50/80",
         isToday && "bg-blue-50/60 ring-1 ring-inset ring-blue-300/80",
-        isOver && "bg-brand-50/70 ring-2 ring-brand-300"
+        isOver && "bg-brand-50/70 ring-2 ring-brand-300",
+        rangeHighlight && "relative z-[2] bg-brand-100/80 ring-2 ring-inset ring-brand-400/70"
       )}
     >
       {children}
+    </div>
+  );
+}
+
+const SNAP_MINUTES = 15;
+const MINUTES_IN_DAY = 24 * 60;
+
+function snapToQuarterMinutes(rawMin: number): number {
+  const clamped = Math.max(0, Math.min(MINUTES_IN_DAY, rawMin));
+  let s = Math.round(clamped / SNAP_MINUTES) * SNAP_MINUTES;
+  if (s >= MINUTES_IN_DAY) {
+    s = MINUTES_IN_DAY - SNAP_MINUTES;
+  }
+  return s;
+}
+
+/** 드래그 끝 시각을 당일 내로 맞추고, 최소 15분 구간 보장 */
+function finalizeTimeRange(anchorMin: number, endMin: number): { startMin: number; endMin: number } | null {
+  let a = snapToQuarterMinutes(anchorMin);
+  let b = snapToQuarterMinutes(endMin);
+  if (a > b) {
+    [a, b] = [b, a];
+  }
+  if (b - a < SNAP_MINUTES) {
+    b = Math.min(a + SNAP_MINUTES, MINUTES_IN_DAY - 1);
+  }
+  b = Math.min(b, MINUTES_IN_DAY - 1);
+  if (b <= a) {
+    b = Math.min(a + SNAP_MINUTES, MINUTES_IN_DAY - 1);
+  }
+  if (b <= a) {
+    return null;
+  }
+  return { startMin: a, endMin: b };
+}
+
+function minutesToHHmm(day: dayjs.Dayjs, mins: number): string {
+  return day.startOf("day").add(mins, "minute").format("HH:mm");
+}
+
+/**
+ * 일/주 시간축 빈 영역에서만 포인터를 받습니다(상위 pointer-events-none + 이벤트 칩만 auto).
+ * 이벤트 DnD·칩 클릭과 겹치지 않게 z-order로 분리합니다.
+ */
+function TimeGridRangeSelector({
+  pixelsPerHour,
+  onRangeComplete,
+  disabled
+}: {
+  pixelsPerHour: number;
+  onRangeComplete: (range: { startMin: number; endMin: number }) => void;
+  disabled?: boolean;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ anchor: number; current: number } | null>(null);
+  const winListenersRef = useRef<{ move: (e: PointerEvent) => void; up: (e: PointerEvent) => void } | null>(
+    null
+  );
+  const onRangeCompleteRef = useRef(onRangeComplete);
+  onRangeCompleteRef.current = onRangeComplete;
+
+  const [drag, setDrag] = useState<{ anchorMin: number; currentMin: number } | null>(null);
+
+  const rawMinutesFromClientY = useCallback(
+    (clientY: number) => {
+      const el = hostRef.current;
+      if (!el) return 0;
+      const rect = el.getBoundingClientRect();
+      const y = Math.min(Math.max(0, clientY - rect.top), Math.max(0, rect.height - 0.5));
+      return (y / pixelsPerHour) * 60;
+    },
+    [pixelsPerHour]
+  );
+
+  const removeWindowListeners = useCallback(() => {
+    const l = winListenersRef.current;
+    if (l) {
+      window.removeEventListener("pointermove", l.move);
+      window.removeEventListener("pointerup", l.up);
+      window.removeEventListener("pointercancel", l.up);
+      winListenersRef.current = null;
+    }
+  }, []);
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      if (disabled || e.button !== 0) return;
+      e.preventDefault();
+      removeWindowListeners();
+      const anchor = snapToQuarterMinutes(rawMinutesFromClientY(e.clientY));
+      dragRef.current = { anchor, current: anchor };
+      setDrag({ anchorMin: anchor, currentMin: anchor });
+
+      const move = (ev: PointerEvent) => {
+        const d = dragRef.current;
+        if (!d) return;
+        const cur = snapToQuarterMinutes(rawMinutesFromClientY(ev.clientY));
+        dragRef.current = { anchor: d.anchor, current: cur };
+        setDrag({ anchorMin: d.anchor, currentMin: cur });
+      };
+      const up = () => {
+        const d = dragRef.current;
+        dragRef.current = null;
+        setDrag(null);
+        removeWindowListeners();
+        if (d) {
+          const fin = finalizeTimeRange(d.anchor, d.current);
+          if (fin) {
+            onRangeCompleteRef.current(fin);
+          }
+        }
+      };
+      winListenersRef.current = { move, up };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+    },
+    [disabled, rawMinutesFromClientY, removeWindowListeners]
+  );
+
+  useEffect(() => {
+    return () => {
+      removeWindowListeners();
+      dragRef.current = null;
+    };
+  }, [removeWindowListeners]);
+
+  const overlay =
+    drag != null
+      ? (() => {
+          const lo = Math.min(drag.anchorMin, drag.currentMin);
+          const hi = Math.max(drag.anchorMin, drag.currentMin);
+          const topPx = (lo / 60) * pixelsPerHour;
+          const hPx = Math.max(((hi - lo) / 60) * pixelsPerHour, 4);
+          return (
+            <div
+              className="pointer-events-none absolute left-1 right-1 rounded-md border border-brand-400/60 bg-brand-500/25"
+              style={{ top: topPx, height: hPx }}
+            />
+          );
+        })()
+      : null;
+
+  return (
+    <div
+      ref={hostRef}
+      role="presentation"
+      aria-hidden
+      className={clsx(
+        "absolute inset-0 z-[1] select-none touch-none",
+        disabled ? "pointer-events-none" : "cursor-crosshair"
+      )}
+      onPointerDown={onPointerDown}
+    >
+      {overlay}
+    </div>
+  );
+}
+
+function WeekTimeGridRangeSelector({
+  dayKeys,
+  pixelsPerHour,
+  disabled,
+  onRangeComplete
+}: {
+  dayKeys: string[];
+  pixelsPerHour: number;
+  disabled?: boolean;
+  onRangeComplete: (range: {
+    startDayKey: string;
+    endDayKey: string;
+    startMin: number;
+    endMin: number;
+  }) => void;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ dayIdx: number; min: number }[] | null>(null);
+  const listenersRef = useRef<{ move: (e: PointerEvent) => void; up: () => void } | null>(null);
+  const onRangeCompleteRef = useRef(onRangeComplete);
+  onRangeCompleteRef.current = onRangeComplete;
+  const [drag, setDrag] = useState<{ a: { dayIdx: number; min: number }; b: { dayIdx: number; min: number } } | null>(null);
+
+  const removeListeners = useCallback(() => {
+    const l = listenersRef.current;
+    if (!l) return;
+    window.removeEventListener("pointermove", l.move);
+    window.removeEventListener("pointerup", l.up);
+    window.removeEventListener("pointercancel", l.up);
+    listenersRef.current = null;
+  }, []);
+
+  const pointToPos = useCallback(
+    (clientX: number, clientY: number) => {
+      const el = hostRef.current;
+      if (!el) return { dayIdx: 0, min: 0 };
+      const rect = el.getBoundingClientRect();
+      const colW = rect.width / 7;
+      const x = Math.min(Math.max(0, clientX - rect.left), Math.max(0, rect.width - 0.5));
+      const y = Math.min(Math.max(0, clientY - rect.top), Math.max(0, rect.height - 0.5));
+      const dayIdx = Math.min(6, Math.max(0, Math.floor(x / Math.max(colW, 1))));
+      const min = snapToQuarterMinutes((y / pixelsPerHour) * 60);
+      return { dayIdx, min };
+    },
+    [pixelsPerHour]
+  );
+
+  const cmp = (x: { dayIdx: number; min: number }, y: { dayIdx: number; min: number }) =>
+    x.dayIdx === y.dayIdx ? x.min - y.min : x.dayIdx - y.dayIdx;
+
+  const onPointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (disabled || e.button !== 0) return;
+      e.preventDefault();
+      removeListeners();
+      const a = pointToPos(e.clientX, e.clientY);
+      dragRef.current = [a, a];
+      setDrag({ a, b: a });
+
+      const move = (ev: PointerEvent) => {
+        if (!dragRef.current) return;
+        const b = pointToPos(ev.clientX, ev.clientY);
+        dragRef.current = [dragRef.current[0], b];
+        setDrag({ a: dragRef.current[0], b });
+      };
+      const up = () => {
+        const current = dragRef.current;
+        dragRef.current = null;
+        setDrag(null);
+        removeListeners();
+        if (!current) return;
+        let [aPos, bPos] = current;
+        if (cmp(aPos, bPos) > 0) {
+          [aPos, bPos] = [bPos, aPos];
+        }
+        if (aPos.dayIdx === bPos.dayIdx) {
+          const fin = finalizeTimeRange(aPos.min, bPos.min);
+          if (!fin) return;
+          onRangeCompleteRef.current({
+            startDayKey: dayKeys[aPos.dayIdx],
+            endDayKey: dayKeys[bPos.dayIdx],
+            startMin: fin.startMin,
+            endMin: fin.endMin
+          });
+          return;
+        }
+        onRangeCompleteRef.current({
+          startDayKey: dayKeys[aPos.dayIdx],
+          endDayKey: dayKeys[bPos.dayIdx],
+          startMin: aPos.min,
+          endMin: bPos.min
+        });
+      };
+
+      listenersRef.current = { move, up };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+    },
+    [disabled, dayKeys, pointToPos, removeListeners]
+  );
+
+  useEffect(() => {
+    return () => {
+      removeListeners();
+      dragRef.current = null;
+    };
+  }, [removeListeners]);
+
+  const overlay =
+    drag != null
+      ? (() => {
+          let a = drag.a;
+          let b = drag.b;
+          if (cmp(a, b) > 0) {
+            [a, b] = [b, a];
+          }
+          const hpx = pixelsPerHour / 60;
+          const colPct = 100 / 7;
+          if (a.dayIdx === b.dayIdx) {
+            const lo = Math.min(a.min, b.min);
+            const hi = Math.max(a.min, b.min);
+            const top = lo * hpx;
+            const height = Math.max((hi - lo) * hpx, 4);
+            return (
+              <div
+                className="pointer-events-none absolute rounded-md border border-brand-400/60 bg-brand-500/25"
+                style={{
+                  top,
+                  height,
+                  left: `${a.dayIdx * colPct}%`,
+                  width: `${colPct}%`
+                }}
+              />
+            );
+          }
+          const startTop = a.min * hpx;
+          const startHeight = Math.max((MINUTES_IN_DAY - a.min) * hpx, 4);
+          const endTop = 0;
+          const endHeight = Math.max(b.min * hpx, 4);
+          return (
+            <>
+              <div
+                className="pointer-events-none absolute rounded-md border border-brand-400/60 bg-brand-500/25"
+                style={{
+                  top: startTop,
+                  height: startHeight,
+                  left: `${a.dayIdx * colPct}%`,
+                  width: `${colPct}%`
+                }}
+              />
+              {b.dayIdx - a.dayIdx > 1 && (
+                <div
+                  className="pointer-events-none absolute rounded-md border border-brand-400/60 bg-brand-500/25"
+                  style={{
+                    top: 0,
+                    height: `${MINUTES_IN_DAY * hpx}px`,
+                    left: `${(a.dayIdx + 1) * colPct}%`,
+                    width: `${(b.dayIdx - a.dayIdx - 1) * colPct}%`
+                  }}
+                />
+              )}
+              <div
+                className="pointer-events-none absolute rounded-md border border-brand-400/60 bg-brand-500/25"
+                style={{
+                  top: endTop,
+                  height: endHeight,
+                  left: `${b.dayIdx * colPct}%`,
+                  width: `${colPct}%`
+                }}
+              />
+            </>
+          );
+        })()
+      : null;
+
+  return (
+    <div
+      ref={hostRef}
+      role="presentation"
+      aria-hidden
+      className={clsx(
+        "absolute inset-0 z-[1] select-none touch-none",
+        disabled ? "pointer-events-none" : "cursor-crosshair"
+      )}
+      onPointerDown={onPointerDown}
+    >
+      {overlay}
     </div>
   );
 }
@@ -223,6 +582,19 @@ export function CalendarWorkspace() {
   const [detail, setDetail] = useState<CalendarEvent | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [createDate, setCreateDate] = useState<string | null>(null);
+  const [createTimeRange, setCreateTimeRange] = useState<{ start: string; end: string } | null>(null);
+  /** 생성 모달: 월 뷰 다중 날짜 드래그 시에만 설정 */
+  const [createDateRange, setCreateDateRange] = useState<{ startDate: string; endDate: string } | null>(null);
+  const [createModalKey, setCreateModalKey] = useState(0);
+
+  const [monthRangeDrag, setMonthRangeDrag] = useState<{ anchor: string; hover: string } | null>(null);
+  const monthRangeSessionRef = useRef<{
+    anchor: string;
+    hover: string;
+    sx: number;
+    sy: number;
+  } | null>(null);
+  const monthRangeWinCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (detail) {
@@ -305,6 +677,8 @@ export function CalendarWorkspace() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["events"] });
       setCreateOpen(false);
+      setCreateTimeRange(null);
+      setCreateDateRange(null);
     }
   });
 
@@ -316,7 +690,7 @@ export function CalendarWorkspace() {
     }
   });
 
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
 
   const [hideAnnouncements, setHideAnnouncements] = useState(false);
   useEffect(() => {
@@ -356,6 +730,119 @@ export function CalendarWorkspace() {
     const start = cursor.startOf("isoWeek");
     return Array.from({ length: 7 }, (_, i) => start.add(i, "day"));
   }, [cursor]);
+
+  const openCreateFromMonthRange = useCallback((lo: string, hi: string) => {
+    setCreateDate(lo);
+    if (lo !== hi) {
+      setCreateDateRange({ startDate: lo, endDate: hi });
+      setCreateTimeRange({ start: "00:00", end: "23:59" });
+    } else {
+      setCreateDateRange(null);
+      setCreateTimeRange(null);
+    }
+    setCreateModalKey((k) => k + 1);
+    setCreateOpen(true);
+  }, []);
+
+  const openCreateFromRange = useCallback((dayKey: string, range: { startMin: number; endMin: number }) => {
+    const d = dayjs(dayKey);
+    setCreateDate(dayKey);
+    setCreateDateRange(null);
+    setCreateTimeRange({
+      start: minutesToHHmm(d, range.startMin),
+      end: minutesToHHmm(d, range.endMin)
+    });
+    setCreateModalKey((k) => k + 1);
+    setCreateOpen(true);
+  }, []);
+
+  const openCreateFromWeekRange = useCallback(
+    (range: { startDayKey: string; endDayKey: string; startMin: number; endMin: number }) => {
+      const startDay = dayjs(range.startDayKey);
+      const endDay = dayjs(range.endDayKey);
+      setCreateDate(range.startDayKey);
+      const sameDay = range.startDayKey === range.endDayKey;
+      setCreateDateRange(
+        sameDay ? null : { startDate: range.startDayKey, endDate: range.endDayKey }
+      );
+      setCreateTimeRange({
+        start: minutesToHHmm(startDay, range.startMin),
+        end: minutesToHHmm(endDay, range.endMin)
+      });
+      setCreateModalKey((k) => k + 1);
+      setCreateOpen(true);
+    },
+    []
+  );
+
+  const clearMonthRangeWindowListeners = useCallback(() => {
+    monthRangeWinCleanupRef.current?.();
+    monthRangeWinCleanupRef.current = null;
+    monthRangeSessionRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearMonthRangeWindowListeners();
+    };
+  }, [clearMonthRangeWindowListeners]);
+
+  useEffect(() => {
+    if (view !== "month" || createOpen) {
+      clearMonthRangeWindowListeners();
+      setMonthRangeDrag(null);
+    }
+  }, [view, createOpen, clearMonthRangeWindowListeners]);
+
+  const onMonthGridCellPointerDown = useCallback(
+    (anchorKey: string, e: ReactPointerEvent<HTMLDivElement>) => {
+      if (view !== "month" || createOpen) return;
+      if (e.button !== 0) return;
+      clearMonthRangeWindowListeners();
+      const sx = e.clientX;
+      const sy = e.clientY;
+      monthRangeSessionRef.current = { anchor: anchorKey, hover: anchorKey, sx, sy };
+      setMonthRangeDrag({ anchor: anchorKey, hover: anchorKey });
+
+      const move = (ev: PointerEvent) => {
+        const sess = monthRangeSessionRef.current;
+        if (!sess) return;
+        const k = monthDayKeyFromPoint(ev.clientX, ev.clientY);
+        if (k) {
+          sess.hover = k;
+          setMonthRangeDrag({ anchor: sess.anchor, hover: k });
+        }
+      };
+
+      const finish = (ev: PointerEvent) => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        monthRangeWinCleanupRef.current = null;
+        const sess = monthRangeSessionRef.current;
+        monthRangeSessionRef.current = null;
+        setMonthRangeDrag(null);
+        if (!sess) return;
+        const lo = sess.anchor <= sess.hover ? sess.anchor : sess.hover;
+        const hi = sess.anchor <= sess.hover ? sess.hover : sess.anchor;
+        const dist = Math.hypot(ev.clientX - sess.sx, ev.clientY - sess.sy);
+        const crossCell = lo !== hi;
+        if (crossCell || dist >= 12) {
+          openCreateFromMonthRange(lo, hi);
+        }
+      };
+
+      monthRangeWinCleanupRef.current = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [view, createOpen, clearMonthRangeWindowListeners, openCreateFromMonthRange]
+  );
 
   function handleDragStart(e: DragStartEvent) {
     const data = e.active.data.current as { event?: CalendarEvent } | undefined;
@@ -455,6 +942,9 @@ export function CalendarWorkspace() {
             type="button"
             onClick={() => {
               setCreateDate(cursor.format("YYYY-MM-DD"));
+              setCreateDateRange(null);
+              setCreateTimeRange(null);
+              setCreateModalKey((k) => k + 1);
               setCreateOpen(true);
             }}
             className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
@@ -485,37 +975,74 @@ export function CalendarWorkspace() {
                   const inMonth = day.month() === cursor.month();
                   const today = day.isSame(dayjs(), "day");
                   const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, day));
+                  const dragLo =
+                    monthRangeDrag &&
+                    (monthRangeDrag.anchor <= monthRangeDrag.hover
+                      ? monthRangeDrag.anchor
+                      : monthRangeDrag.hover);
+                  const dragHi =
+                    monthRangeDrag &&
+                    (monthRangeDrag.anchor <= monthRangeDrag.hover
+                      ? monthRangeDrag.hover
+                      : monthRangeDrag.anchor);
+                  const rangeHighlight = Boolean(monthRangeDrag && dragLo && dragHi && key >= dragLo && key <= dragHi);
                   return (
-                    <DroppableDayCell key={key} dayKey={key} isToday={today} muted={!inMonth}>
-                      <div className="mb-1 flex justify-between">
-                        <span
+                    <DroppableDayCell
+                      key={key}
+                      dayKey={key}
+                      isToday={today}
+                      muted={!inMonth}
+                      rangeHighlight={rangeHighlight}
+                    >
+                      <div className="relative flex min-h-[84px] flex-col">
+                        <div
+                          role="presentation"
+                          data-month-day={key}
                           className={clsx(
-                            "text-sm font-medium",
-                            today ? "flex h-7 w-7 items-center justify-center rounded-full bg-blue-600 text-white" : "text-slate-800"
+                            "absolute inset-0 z-0 touch-none select-none",
+                            createOpen ? "pointer-events-none" : "cursor-crosshair"
                           )}
-                        >
-                          {day.date()}
-                        </span>
-                        {inMonth && (
-                          <button
-                            type="button"
-                            className="text-xs text-brand-600 hover:underline"
-                            onClick={() => {
-                              setCreateDate(key);
-                              setCreateOpen(true);
-                            }}
-                          >
-                            +
-                          </button>
-                        )}
-                      </div>
-                      <div className="flex max-h-[72px] flex-col gap-0.5 overflow-hidden">
-                        {dayEvents.slice(0, 3).map((ev) => (
-                          <DraggableEventChip key={ev.id} event={ev} compact onClick={setDetail} />
-                        ))}
-                        {dayEvents.length > 3 && (
-                          <span className="truncate pl-1 text-[10px] text-slate-500">+{dayEvents.length - 3}건</span>
-                        )}
+                          onPointerDown={(e) => onMonthGridCellPointerDown(key, e)}
+                        />
+                        <div className="pointer-events-none relative z-[1] flex min-h-0 flex-1 flex-col">
+                          <div className="mb-1 flex justify-between">
+                            <span
+                              className={clsx(
+                                "text-sm font-medium",
+                                today
+                                  ? "flex h-7 w-7 items-center justify-center rounded-full bg-blue-600 text-white"
+                                  : "text-slate-800"
+                              )}
+                            >
+                              {day.date()}
+                            </span>
+                            {inMonth && (
+                              <button
+                                type="button"
+                                className="pointer-events-auto text-xs text-brand-600 hover:underline"
+                                onClick={() => {
+                                  setCreateDate(key);
+                                  setCreateDateRange(null);
+                                  setCreateTimeRange(null);
+                                  setCreateModalKey((k) => k + 1);
+                                  setCreateOpen(true);
+                                }}
+                              >
+                                +
+                              </button>
+                            )}
+                          </div>
+                          <div className="flex max-h-[72px] flex-col gap-0.5 overflow-hidden">
+                            {dayEvents.slice(0, 3).map((ev) => (
+                              <DraggableEventChip key={ev.id} event={ev} compact onClick={setDetail} />
+                            ))}
+                            {dayEvents.length > 3 && (
+                              <span className="truncate pl-1 text-[10px] text-slate-500">
+                                +{dayEvents.length - 3}건
+                              </span>
+                            )}
+                          </div>
+                        </div>
                       </div>
                     </DroppableDayCell>
                   );
@@ -552,7 +1079,7 @@ export function CalendarWorkspace() {
                   );
                 })}
               </div>
-              <div className="grid grid-cols-8">
+              <div className="relative grid grid-cols-8">
                 <div className="border-r border-slate-200 bg-slate-50/50 py-1 text-right text-[10px] text-slate-400">
                   {Array.from({ length: 24 }, (_, h) => (
                     <div key={h} className="h-12 pr-1 leading-[48px]">
@@ -568,42 +1095,54 @@ export function CalendarWorkspace() {
                   return (
                     <DroppableDayCell key={key} dayKey={key} isToday={today} muted={false}>
                       <div className="relative min-h-[1152px] min-w-[120px]">
-                        {Array.from({ length: 24 }, (_, h) => (
-                          <div key={h} className="h-12 border-b border-slate-100" />
-                        ))}
-                        {dayEvents.map((ev) => {
-                          const start = dayjs(ev.startsAt);
-                          const end = dayjs(ev.endsAt);
-                          const dayStart = d.startOf("day");
-                          const topMin = Math.max(0, start.diff(dayStart, "minute"));
-                          const endMin = Math.min(24 * 60, end.diff(dayStart, "minute"));
-                          const hpx = 48;
-                          const top = (topMin / 60) * hpx;
-                          const height = Math.max(24, ((endMin - topMin) / 60) * hpx);
-                          const stack = stackMap.get(ev.id)!;
-                          const leftPct = (stack.col / stack.colCount) * 100;
-                          const widthPct = 100 / stack.colCount;
-                          return (
-                            <div
-                              key={ev.id}
-                              className="absolute box-border px-0.5"
-                              style={{
-                                top,
-                                height,
-                                minHeight: 28,
-                                left: `${leftPct}%`,
-                                width: `${widthPct}%`,
-                                right: "auto"
-                              }}
-                            >
-                              <DraggableEventChip event={ev} onClick={setDetail} />
-                            </div>
-                          );
-                        })}
+                        <div className="relative z-0">
+                          {Array.from({ length: 24 }, (_, h) => (
+                            <div key={h} className="h-12 border-b border-slate-100" />
+                          ))}
+                        </div>
+                        <div className="pointer-events-none absolute inset-0 z-[2]">
+                          {dayEvents.map((ev) => {
+                            const start = dayjs(ev.startsAt);
+                            const end = dayjs(ev.endsAt);
+                            const dayStart = d.startOf("day");
+                            const topMin = Math.max(0, start.diff(dayStart, "minute"));
+                            const endMin = Math.min(24 * 60, end.diff(dayStart, "minute"));
+                            const hpx = 48;
+                            const top = (topMin / 60) * hpx;
+                            const height = Math.max(24, ((endMin - topMin) / 60) * hpx);
+                            const stack = stackMap.get(ev.id)!;
+                            const leftPct = (stack.col / stack.colCount) * 100;
+                            const widthPct = 100 / stack.colCount;
+                            return (
+                              <div
+                                key={ev.id}
+                                className="pointer-events-auto absolute box-border px-0.5"
+                                style={{
+                                  top,
+                                  height,
+                                  minHeight: 28,
+                                  left: `${leftPct}%`,
+                                  width: `${widthPct}%`,
+                                  right: "auto"
+                                }}
+                              >
+                                <DraggableEventChip event={ev} onClick={setDetail} />
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
                     </DroppableDayCell>
                   );
                 })}
+                <div className="absolute inset-y-0 left-[12.5%] right-0">
+                  <WeekTimeGridRangeSelector
+                    dayKeys={weekDays.map((d) => d.format("YYYY-MM-DD"))}
+                    pixelsPerHour={48}
+                    disabled={createOpen}
+                    onRangeComplete={openCreateFromWeekRange}
+                  />
+                </div>
               </div>
             </div>
           )}
@@ -633,42 +1172,53 @@ export function CalendarWorkspace() {
                   muted={false}
                 >
                   <div className="relative min-h-[1344px] w-full min-w-[280px]">
-                    {Array.from({ length: 24 }, (_, h) => (
-                      <div key={h} className="h-14 border-b border-slate-100" />
-                    ))}
-                    {(() => {
-                      const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, cursor));
-                      const stackMap = layoutTimedEventsStack(dayEvents, cursor);
-                      return dayEvents.map((ev) => {
-                        const start = dayjs(ev.startsAt);
-                        const end = dayjs(ev.endsAt);
-                        const dayStart = cursor.startOf("day");
-                        const topMin = Math.max(0, start.diff(dayStart, "minute"));
-                        const endMin = Math.min(24 * 60, end.diff(dayStart, "minute"));
-                        const hpx = 56;
-                        const top = (topMin / 60) * hpx;
-                        const height = Math.max(28, ((endMin - topMin) / 60) * hpx);
-                        const stack = stackMap.get(ev.id)!;
-                        const leftPct = (stack.col / stack.colCount) * 100;
-                        const widthPct = 100 / stack.colCount;
-                        return (
-                          <div
-                            key={ev.id}
-                            className="absolute box-border px-1"
-                            style={{
-                              top,
-                              height,
-                              minHeight: 28,
-                              left: `${leftPct}%`,
-                              width: `${widthPct}%`,
-                              right: "auto"
-                            }}
-                          >
-                            <DraggableEventChip event={ev} onClick={setDetail} />
-                          </div>
-                        );
-                      });
-                    })()}
+                    <div className="relative z-0">
+                      {Array.from({ length: 24 }, (_, h) => (
+                        <div key={h} className="h-14 border-b border-slate-100" />
+                      ))}
+                    </div>
+                    <TimeGridRangeSelector
+                      pixelsPerHour={56}
+                      disabled={createOpen}
+                      onRangeComplete={(range) =>
+                        openCreateFromRange(cursor.format("YYYY-MM-DD"), range)
+                      }
+                    />
+                    <div className="pointer-events-none absolute inset-0 z-[2]">
+                      {(() => {
+                        const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, cursor));
+                        const stackMap = layoutTimedEventsStack(dayEvents, cursor);
+                        return dayEvents.map((ev) => {
+                          const start = dayjs(ev.startsAt);
+                          const end = dayjs(ev.endsAt);
+                          const dayStart = cursor.startOf("day");
+                          const topMin = Math.max(0, start.diff(dayStart, "minute"));
+                          const endMin = Math.min(24 * 60, end.diff(dayStart, "minute"));
+                          const hpx = 56;
+                          const top = (topMin / 60) * hpx;
+                          const height = Math.max(28, ((endMin - topMin) / 60) * hpx);
+                          const stack = stackMap.get(ev.id)!;
+                          const leftPct = (stack.col / stack.colCount) * 100;
+                          const widthPct = 100 / stack.colCount;
+                          return (
+                            <div
+                              key={ev.id}
+                              className="pointer-events-auto absolute box-border px-1"
+                              style={{
+                                top,
+                                height,
+                                minHeight: 28,
+                                left: `${leftPct}%`,
+                                width: `${widthPct}%`,
+                                right: "auto"
+                              }}
+                            >
+                              <DraggableEventChip event={ev} onClick={setDetail} />
+                            </div>
+                          );
+                        });
+                      })()}
+                    </div>
                   </div>
                 </DroppableDayCell>
                 </div>
@@ -687,15 +1237,21 @@ export function CalendarWorkspace() {
 
       {createOpen && (
         <EventFormModal
-          key={createDate ?? "create"}
+          key={`create-${createModalKey}`}
           mode="create"
           initialDate={createDate ?? cursor.format("YYYY-MM-DD")}
+          initialTimeRange={createTimeRange}
+          initialDateRange={createDateRange}
           users={usersQuery.data ?? []}
           departments={departmentsQuery.data ?? []}
           defaultDepartmentId={meQuery.data?.departmentId ?? null}
           loading={createMutation.isPending}
           error={createMutation.error as Error | null}
-          onClose={() => setCreateOpen(false)}
+          onClose={() => {
+            setCreateOpen(false);
+            setCreateTimeRange(null);
+            setCreateDateRange(null);
+          }}
           onSubmit={(payload) => createMutation.mutate(payload)}
         />
       )}
@@ -725,6 +1281,8 @@ export function CalendarWorkspace() {
 function EventFormModal({
   mode,
   initialDate,
+  initialTimeRange = null,
+  initialDateRange = null,
   event,
   users,
   departments,
@@ -738,6 +1296,10 @@ function EventFormModal({
 }: {
   mode: "create" | "edit";
   initialDate?: string;
+  /** 생성 모드: 시간축 드래그 등으로 전달되는 시작·종료 HH:mm */
+  initialTimeRange?: { start: string; end: string } | null;
+  /** 생성 모드: 월 뷰 다중 날짜 드래그 시 시작·종료 일자 */
+  initialDateRange?: { startDate: string; endDate: string } | null;
   event?: CalendarEvent;
   users: UserOption[];
   departments: { id: string; name: string; code: string }[];
@@ -755,11 +1317,20 @@ function EventFormModal({
   }
   const [title, setTitle] = useState(() => event?.title ?? "");
   const [description, setDescription] = useState(() => event?.description ?? "");
-  const [dateStr, setDateStr] = useState(() =>
-    event ? dayjs(event.startsAt).format("YYYY-MM-DD") : initialDate ?? dayjs().format("YYYY-MM-DD")
+  const startDayInit = event
+    ? dayjs(event.startsAt).format("YYYY-MM-DD")
+    : (initialDateRange?.startDate ?? initialDate ?? dayjs().format("YYYY-MM-DD"));
+  const endDayInit = event
+    ? dayjs(event.endsAt).format("YYYY-MM-DD")
+    : (initialDateRange?.endDate ?? startDayInit);
+  const [dateStr, setDateStr] = useState(() => startDayInit);
+  const [endDateStr, setEndDateStr] = useState(() => endDayInit);
+  const [startT, setStartT] = useState(() =>
+    event ? dayjs(event.startsAt).format("HH:mm") : initialTimeRange?.start ?? "09:00"
   );
-  const [startT, setStartT] = useState(() => (event ? dayjs(event.startsAt).format("HH:mm") : "09:00"));
-  const [endT, setEndT] = useState(() => (event ? dayjs(event.endsAt).format("HH:mm") : "10:00"));
+  const [endT, setEndT] = useState(() =>
+    event ? dayjs(event.endsAt).format("HH:mm") : initialTimeRange?.end ?? "10:00"
+  );
   const [kind, setKind] = useState<CalendarKind>(() => event?.kind ?? "personal");
   const [attendeeIds, setAttendeeIds] = useState<Set<string>>(
     () => new Set(event?.attendeeUserIds ?? [])
@@ -788,20 +1359,22 @@ function EventFormModal({
       .slice(0, 80);
   }, [attendeeQuery, defaultDepartmentId, users]);
 
-  type FieldKey = "title" | "date" | "start" | "end" | "range" | "dept";
+  const showEndDate =
+    mode === "create"
+      ? Boolean(initialDateRange && initialDateRange.startDate !== initialDateRange.endDate)
+      : Boolean(
+          event &&
+            dayjs(event.endsAt).format("YYYY-MM-DD") !== dayjs(event.startsAt).format("YYYY-MM-DD")
+        );
+
+  type FieldKey = "title" | "date" | "endDate" | "start" | "end" | "range" | "dept";
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<FieldKey, string>>>({});
 
   function buildPayload(): Record<string, unknown> {
     const [sh, sm] = startT.split(":").map(Number);
     const [eh, em] = endT.split(":").map(Number);
-    const base = dayjs(dateStr).hour(sh).minute(sm).second(0).millisecond(0);
-    const startsAt = base.toISOString();
-    const endsAt = base
-      .hour(eh)
-      .minute(em)
-      .second(0)
-      .millisecond(0)
-      .toISOString();
+    const startsAt = dayjs(dateStr).hour(sh).minute(sm).second(0).millisecond(0).toISOString();
+    const endsAt = dayjs(endDateStr).hour(eh).minute(em).second(0).millisecond(0).toISOString();
     const payload: Record<string, unknown> = {
       title: title.trim(),
       description: description.trim() || null,
@@ -825,14 +1398,20 @@ function EventFormModal({
           const next: Partial<Record<FieldKey, string>> = {};
           if (!title.trim()) next.title = "제목을 입력해 주세요.";
           if (!dateStr) next.date = "날짜를 선택해 주세요.";
+          if (showEndDate && !endDateStr) next.endDate = "종료 날짜를 선택해 주세요.";
+          if (showEndDate && endDateStr && dateStr && endDateStr < dateStr) {
+            next.endDate = "종료 날짜는 시작 날짜 이후여야 합니다.";
+          }
           if (!startT) next.start = "시작 시간을 선택해 주세요.";
           if (!endT) next.end = "종료 시간을 선택해 주세요.";
           setFieldErrors(next);
           if (Object.keys(next).length > 0) return;
 
           const payload = buildPayload();
-          if (new Date(String(payload.endsAt)) <= new Date(String(payload.startsAt))) {
-            setFieldErrors({ range: "종료 시간은 시작 시간보다 늦어야 합니다." });
+          const sDt = dayjs(dateStr).hour(Number(startT.split(":")[0])).minute(Number(startT.split(":")[1]));
+          const eDt = dayjs(endDateStr).hour(Number(endT.split(":")[0])).minute(Number(endT.split(":")[1]));
+          if (!eDt.isAfter(sDt)) {
+            setFieldErrors({ range: "종료 시각은 시작 시각보다 늦어야 합니다." });
             return;
           }
           if (kind === "team" && !teamDeptId) {
@@ -858,7 +1437,7 @@ function EventFormModal({
           {fieldErrors.title && <p className="mt-1 text-xs text-red-600">{fieldErrors.title}</p>}
         </label>
         <label className="block">
-          <span className="text-xs font-semibold text-slate-500">날짜</span>
+          <span className="text-xs font-semibold text-slate-500">{showEndDate ? "시작 날짜" : "날짜"}</span>
           <input
             type="date"
             className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
@@ -866,17 +1445,38 @@ function EventFormModal({
             }`}
             value={dateStr}
             onChange={(e) => {
-              setDateStr(e.target.value);
-              setFieldErrors((f) => ({ ...f, date: undefined }));
+              const v = e.target.value;
+              setDateStr(v);
+              if (!showEndDate) setEndDateStr(v);
+              setFieldErrors((f) => ({ ...f, date: undefined, endDate: undefined, range: undefined }));
             }}
           />
           {fieldErrors.date && <p className="mt-1 text-xs text-red-600">{fieldErrors.date}</p>}
         </label>
+        {showEndDate ? (
+          <label className="block">
+            <span className="text-xs font-semibold text-slate-500">종료 날짜</span>
+            <input
+              type="date"
+              className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
+                fieldErrors.endDate ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
+              }`}
+              value={endDateStr}
+              min={dateStr}
+              onChange={(e) => {
+                setEndDateStr(e.target.value);
+                setFieldErrors((f) => ({ ...f, endDate: undefined, range: undefined }));
+              }}
+            />
+            {fieldErrors.endDate && <p className="mt-1 text-xs text-red-600">{fieldErrors.endDate}</p>}
+          </label>
+        ) : null}
         <div className="grid grid-cols-2 gap-3">
           <label className="block">
             <span className="text-xs font-semibold text-slate-500">시작</span>
             <input
               type="time"
+              step={900}
               className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
                 fieldErrors.start ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
               }`}
@@ -892,6 +1492,7 @@ function EventFormModal({
             <span className="text-xs font-semibold text-slate-500">종료</span>
             <input
               type="time"
+              step={900}
               className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
                 fieldErrors.end ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
               }`}

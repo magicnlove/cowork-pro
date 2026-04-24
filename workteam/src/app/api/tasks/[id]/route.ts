@@ -98,8 +98,7 @@ async function fetchTaskWithAssignee(id: string, viewerUserId: string): Promise<
       t.created_at,
       t.updated_at,
       (
-        t.assignee_user_id = $2::uuid
-        AND t.status <> 'done'
+        t.status <> 'done'
         AND (utr.read_at IS NULL OR t.updated_at > utr.read_at)
       ) AS is_new
     FROM tasks t

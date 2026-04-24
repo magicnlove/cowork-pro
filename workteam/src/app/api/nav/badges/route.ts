@@ -56,8 +56,7 @@ export async function GET(_request: NextRequest) {
     SELECT COUNT(*)::int AS n
     FROM tasks t
     LEFT JOIN user_task_reads utr ON utr.task_id = t.id AND utr.user_id = $1::uuid
-    WHERE t.assignee_user_id = $1::uuid
-      AND t.status <> 'done'
+    WHERE t.status <> 'done'
       AND (utr.read_at IS NULL OR t.updated_at > utr.read_at)
   `;
   const taskParams: unknown[] = [session.sub];

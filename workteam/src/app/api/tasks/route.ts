@@ -169,8 +169,7 @@ export async function GET(request: NextRequest) {
       t.created_at,
       t.updated_at,
       (
-        t.assignee_user_id = $1::uuid
-        AND t.status <> 'done'
+        t.status <> 'done'
         AND (utr.read_at IS NULL OR t.updated_at > utr.read_at)
       ) AS is_new
     FROM tasks t
@@ -337,7 +336,7 @@ export async function POST(request: NextRequest) {
       task: mapRow({
         ...row,
         assignee_name: nameRes.rows[0]?.name ?? null,
-        is_new: Boolean(row.assignee_user_id === session.sub && row.status !== "done")
+        is_new: row.status !== "done"
       } as TaskRow)
     });
   } catch (e) {

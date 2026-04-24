@@ -18,8 +18,9 @@ export type Task = {
   createdAt: string;
   updatedAt: string;
   /**
-   * 현재 사용자가 담당이고 미완료일 때, 아직 읽지 않았거나 수정 후 다시 '새'로 취급되는 경우.
-   * 담당이 아니면 항상 false에 가깝게 내려옵니다.
+   * 목록에 보이는 태스크 중 미완료이며, 현재 사용자 기준 읽음(user_task_reads)이 없거나
+   * 마지막 읽은 뒤 수정된 경우(다시 새로 취급). 타인이 만든 공통 업무도 동일합니다.
+   * 상세를 열면 markTaskRead로 읽음 처리되어 false로 갱신될 수 있습니다.
    */
   isNew?: boolean;
 };

@@ -12,6 +12,7 @@ export type CalendarEvent = {
   attendeeUserIds: string[];
   attendees: { id: string; name: string; email: string }[];
   createdBy: string | null;
+  createdByUser: { name: string; departmentName: string | null } | null;
   createdAt: string;
   updatedAt: string;
 };

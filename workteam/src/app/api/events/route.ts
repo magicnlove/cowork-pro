@@ -126,7 +126,42 @@ async function resolveAttendeesMap(rows: EventRow[]) {
   return out;
 }
 
-function mapEvent(row: EventRow, attendees: { id: string; name: string; email: string }[]) {
+async function resolveCreatorsMap(rows: EventRow[]) {
+  const creatorIds = [...new Set(rows.map((r) => r.created_by).filter(Boolean) as string[])];
+  if (creatorIds.length === 0) {
+    return new Map<string, { name: string; departmentName: string | null }>();
+  }
+  const res = await db.query<{
+    id: string;
+    name: string;
+    department_name: string | null;
+  }>(
+    `
+    SELECT
+      u.id::text AS id,
+      u.name,
+      d.name AS department_name
+    FROM users u
+    LEFT JOIN LATERAL (
+      SELECT ud.department_id
+      FROM user_departments ud
+      WHERE ud.user_id = u.id
+      ORDER BY ud.is_primary DESC, ud.created_at ASC
+      LIMIT 1
+    ) picked ON true
+    LEFT JOIN departments d ON d.id = picked.department_id
+    WHERE u.id = ANY($1::uuid[])
+    `,
+    [creatorIds]
+  );
+  return new Map(res.rows.map((r) => [r.id, { name: r.name, departmentName: r.department_name }] as const));
+}
+
+function mapEvent(
+  row: EventRow,
+  attendees: { id: string; name: string; email: string }[],
+  createdByUser: { name: string; departmentName: string | null } | null
+) {
   return {
     id: row.id,
     title: row.title,
@@ -139,6 +174,7 @@ function mapEvent(row: EventRow, attendees: { id: string; name: string; email: s
     attendeeUserIds: row.attendee_user_ids ?? [],
     attendees,
     createdBy: row.created_by,
+    createdByUser,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString()
   };
@@ -231,7 +267,10 @@ export async function GET(request: NextRequest) {
   );
 
   const attendeeMap = await resolveAttendeesMap(result.rows);
-  const events = result.rows.map((row) => mapEvent(row, attendeeMap.get(row.id) ?? []));
+  const creatorMap = await resolveCreatorsMap(result.rows);
+  const events = result.rows.map((row) =>
+    mapEvent(row, attendeeMap.get(row.id) ?? [], row.created_by ? creatorMap.get(row.created_by) ?? null : null)
+  );
 
   return NextResponse.json({ events });
 }
@@ -357,6 +396,7 @@ export async function POST(request: NextRequest) {
 
     const row = insert.rows[0];
     const attendees = await resolveAttendees(row.attendee_user_ids ?? []);
+    const creatorMap = await resolveCreatorsMap([row]);
     await createActivityLogSafe({
       userId: session.sub,
       actionType: "event_created",
@@ -369,7 +409,9 @@ export async function POST(request: NextRequest) {
 
     console.info("[POST /api/events] success", { eventId: row.id });
 
-    return NextResponse.json({ event: mapEvent(row, attendees) });
+    return NextResponse.json({
+      event: mapEvent(row, attendees, row.created_by ? creatorMap.get(row.created_by) ?? null : null)
+    });
   } catch (e) {
     logPostEventsFailure("INSERT failed", e, {
       titleLen: title.length,

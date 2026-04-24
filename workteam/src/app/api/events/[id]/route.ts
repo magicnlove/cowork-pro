@@ -89,7 +89,37 @@ async function resolveAttendees(userIds: string[]) {
   return res.rows;
 }
 
-function mapEvent(row: EventRow, attendees: { id: string; name: string; email: string }[]) {
+async function resolveCreator(createdBy: string | null) {
+  if (!createdBy) return null;
+  const res = await db.query<{ name: string; department_name: string | null }>(
+    `
+    SELECT
+      u.name,
+      d.name AS department_name
+    FROM users u
+    LEFT JOIN LATERAL (
+      SELECT ud.department_id
+      FROM user_departments ud
+      WHERE ud.user_id = u.id
+      ORDER BY ud.is_primary DESC, ud.created_at ASC
+      LIMIT 1
+    ) picked ON true
+    LEFT JOIN departments d ON d.id = picked.department_id
+    WHERE u.id = $1::uuid
+    LIMIT 1
+    `,
+    [createdBy]
+  );
+  const row = res.rows[0];
+  if (!row) return null;
+  return { name: row.name, departmentName: row.department_name };
+}
+
+function mapEvent(
+  row: EventRow,
+  attendees: { id: string; name: string; email: string }[],
+  createdByUser: { name: string; departmentName: string | null } | null
+) {
   return {
     id: row.id,
     title: row.title,
@@ -102,6 +132,7 @@ function mapEvent(row: EventRow, attendees: { id: string; name: string; email: s
     attendeeUserIds: row.attendee_user_ids ?? [],
     attendees,
     createdBy: row.created_by,
+    createdByUser,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString()
   };
@@ -155,7 +186,8 @@ export async function GET(_request: NextRequest, context: RouteCtx) {
     return NextResponse.json({ message: "접근 권한이 없습니다." }, { status: 403 });
   }
   const attendees = await resolveAttendees(row.attendee_user_ids ?? []);
-  return NextResponse.json({ event: mapEvent(row, attendees) });
+  const creator = await resolveCreator(row.created_by);
+  return NextResponse.json({ event: mapEvent(row, attendees, creator) });
 }
 
 export async function PATCH(request: NextRequest, context: RouteCtx) {
@@ -322,7 +354,8 @@ export async function PATCH(request: NextRequest, context: RouteCtx) {
   }
 
   const attendees = await resolveAttendees(row.attendee_user_ids ?? []);
-  return NextResponse.json({ event: mapEvent(row, attendees) });
+  const creator = await resolveCreator(row.created_by);
+  return NextResponse.json({ event: mapEvent(row, attendees, creator) });
 }
 
 export async function DELETE(_request: NextRequest, context: RouteCtx) {

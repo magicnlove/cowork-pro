@@ -1840,6 +1840,14 @@ function EventFormModal({
             {fieldErrors.dept && <p className="mt-1 text-xs text-red-600">{fieldErrors.dept}</p>}
           </label>
         ) : null}
+        {event?.createdByUser ? (
+          <div className="block">
+            <span className="text-xs font-semibold text-slate-500">등록자</span>
+            <p className="mt-1 text-sm text-slate-700">
+              {event.createdByUser.name} ({event.createdByUser.departmentName ?? "부서 미지정"})
+            </p>
+          </div>
+        ) : null}
         <label className="block">
           <span className="text-xs font-semibold text-slate-500">참석자</span>
           {attendeeIds.size > 0 ? (

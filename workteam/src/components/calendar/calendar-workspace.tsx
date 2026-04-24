@@ -15,7 +15,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import dayjs from "dayjs";
 import isoWeek from "dayjs/plugin/isoWeek";
-import { ReactNode, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { ReactNode, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { fetchJson } from "@/lib/fetch-json";
 import { markNavBadgeRead } from "@/lib/nav-badge-read";
 import type { UserOption } from "@/types/tasks";
@@ -29,6 +29,14 @@ import {
 dayjs.extend(isoWeek);
 
 const WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"];
+const EVENT_COLOR_PRESETS = [
+  { label: "빨강", value: "#ffd4de" },
+  { label: "주황", value: "#ffe6d5" },
+  { label: "노랑", value: "#fff3d7" },
+  { label: "초록", value: "#e0f7d8" },
+  { label: "파랑", value: "#d8eeff" },
+  { label: "보라", value: "#f3def9" }
+] as const;
 
 function kindStyle(kind: CalendarKind) {
   switch (kind) {
@@ -39,6 +47,13 @@ function kindStyle(kind: CalendarKind) {
     default:
       return "border-l-[3px] border-l-amber-500 bg-amber-50/95 text-amber-950";
   }
+}
+
+function eventSurfaceStyle(ev: CalendarEvent): { className: string; style?: CSSProperties } {
+  if (ev.color) {
+    return { className: "text-slate-900", style: { backgroundColor: ev.color } };
+  }
+  return { className: kindStyle(ev.kind) };
 }
 
 function eventTouchesDay(ev: CalendarEvent, day: dayjs.Dayjs): boolean {
@@ -200,12 +215,13 @@ function DraggableEventChip({
   const style = transform
     ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` }
     : undefined;
+  const surface = eventSurfaceStyle(ev);
 
   return (
     <button
       type="button"
       ref={setNodeRef}
-      style={style}
+      style={style ? { ...surface.style, ...style } : surface.style}
       {...listeners}
       {...attributes}
       onClick={(e) => {
@@ -214,7 +230,7 @@ function DraggableEventChip({
       }}
       className={clsx(
         "pointer-events-auto w-full min-w-0 rounded border border-black/[0.06] px-1.5 py-0.5 text-left text-xs font-medium shadow-sm transition hover:brightness-[0.98]",
-        kindStyle(ev.kind),
+        surface.className,
         compact ? "truncate leading-tight" : "flex min-h-[28px] flex-col gap-0.5 py-1 whitespace-normal break-words [overflow-wrap:anywhere]",
         isDragging && "opacity-40"
       )}
@@ -255,7 +271,10 @@ function DraggableSpanBar({
     id: dragId,
     data: { event: ev }
   });
-  const tStyle = transform ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` } : undefined;
+  const surface = eventSurfaceStyle(ev);
+  const tStyle = transform
+    ? ({ ...(surface.style ?? {}), transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` } as CSSProperties)
+    : surface.style;
   return (
     <button
       type="button"
@@ -269,7 +288,7 @@ function DraggableSpanBar({
       }}
       className={clsx(
         "box-border h-full min-h-0 w-full truncate border border-black/[0.06] px-1.5 text-left text-[10px] font-semibold leading-[16px] shadow-sm transition hover:brightness-[0.98]",
-        kindStyle(ev.kind),
+        surface.className,
         roundedLeft && "rounded-l-md",
         roundedRight && "rounded-r-md",
         isDragging && "opacity-40"
@@ -687,6 +706,7 @@ export function CalendarWorkspace() {
   const qc = useQueryClient();
   const [cursor, setCursor] = useState(() => dayjs());
   const [view, setView] = useState<CalendarViewMode>("month");
+  const [departmentFilter, setDepartmentFilter] = useState<string>("all");
   const [activeEv, setActiveEv] = useState<CalendarEvent | null>(null);
   const [detail, setDetail] = useState<CalendarEvent | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -726,14 +746,6 @@ export function CalendarWorkspace() {
     return { from: d, to: d };
   }, [cursor, view]);
 
-  const eventsQuery = useQuery({
-    queryKey: ["events", range.from, range.to],
-    queryFn: () =>
-      fetchJson<{ events: CalendarEvent[] }>(
-        `/api/events?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`
-      ).then((r) => r.events)
-  });
-
   const usersQuery = useQuery({
     queryKey: ["users"],
     queryFn: () => fetchJson<{ users: UserOption[] }>("/api/users").then((r) => r.users)
@@ -750,7 +762,23 @@ export function CalendarWorkspace() {
   const meQuery = useQuery({
     queryKey: ["chat-me"],
     queryFn: () =>
-      fetchJson<{ user: { departmentId: string | null } }>("/api/chat/me").then((r) => r.user)
+      fetchJson<{ user: { departmentId: string | null; role: "admin" | "manager" | "member" } }>("/api/chat/me").then(
+        (r) => r.user
+      )
+  });
+  const userRole = meQuery.data?.role ?? "member";
+  const canUseDepartmentFilter = userRole === "admin" || userRole === "manager";
+
+  const eventsQuery = useQuery({
+    queryKey: ["events", range.from, range.to, canUseDepartmentFilter ? departmentFilter : "member-fixed"],
+    queryFn: () =>
+      fetchJson<{ events: CalendarEvent[] }>(
+        `/api/events?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}${
+          canUseDepartmentFilter && departmentFilter !== "all"
+            ? `&departmentId=${encodeURIComponent(departmentFilter)}`
+            : ""
+        }`
+      ).then((r) => r.events)
   });
 
   const moveMutation = useMutation({
@@ -824,6 +852,18 @@ export function CalendarWorkspace() {
     }
     return raw.filter((e) => e.kind !== "announcement");
   }, [eventsQuery.data, hideAnnouncements]);
+
+  const departmentFilterOptions = useMemo(() => {
+    if (!canUseDepartmentFilter) return [];
+    const rows = departmentsQuery.data ?? [];
+    return rows.map((d) => ({ id: d.id, label: `${d.name} (${d.code})` }));
+  }, [canUseDepartmentFilter, departmentsQuery.data]);
+
+  useEffect(() => {
+    if (!canUseDepartmentFilter && departmentFilter !== "all") {
+      setDepartmentFilter("all");
+    }
+  }, [canUseDepartmentFilter, departmentFilter]);
 
   const monthCells = useMemo(() => {
     const monthStart = cursor.startOf("month");
@@ -1041,6 +1081,23 @@ export function CalendarWorkspace() {
           </label>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {canUseDepartmentFilter && (
+            <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm text-slate-700">
+              <span className="text-xs font-semibold text-slate-500">부서</span>
+              <select
+                className="bg-transparent text-sm text-slate-800 outline-none"
+                value={departmentFilter}
+                onChange={(e) => setDepartmentFilter(e.target.value)}
+              >
+                <option value="all">전체</option>
+                {departmentFilterOptions.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50/80 p-0.5">
             {(["month", "week", "day"] as const).map((v) => (
               <button
@@ -1532,6 +1589,7 @@ function EventFormModal({
   const [endT, setEndT] = useState(() =>
     event ? dayjs(event.endsAt).format("HH:mm") : initialTimeRange?.end ?? "10:00"
   );
+  const [color, setColor] = useState<string | null>(() => event?.color ?? null);
   const [kind, setKind] = useState<CalendarKind>(() => event?.kind ?? "personal");
   const [attendeeIds, setAttendeeIds] = useState<Set<string>>(
     () => new Set(event?.attendeeUserIds ?? [])
@@ -1582,6 +1640,7 @@ function EventFormModal({
       description: description.trim() || null,
       startsAt,
       endsAt,
+      color,
       kind,
       attendeeUserIds: Array.from(attendeeIds)
     };
@@ -1728,6 +1787,35 @@ function EventFormModal({
               </option>
             ))}
           </select>
+        </label>
+        <label className="block">
+          <span className="text-xs font-semibold text-slate-500">색상</span>
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className={clsx(
+                "rounded-lg border px-2.5 py-1 text-xs",
+                color == null ? "border-slate-300 bg-slate-100 text-slate-700" : "border-slate-200 bg-white text-slate-600"
+              )}
+              onClick={() => setColor(null)}
+            >
+              기본
+            </button>
+            {EVENT_COLOR_PRESETS.map((c) => (
+              <button
+                key={c.value}
+                type="button"
+                aria-label={`색상 ${c.label}`}
+                title={c.label}
+                onClick={() => setColor(c.value)}
+                className={clsx(
+                  "h-7 w-7 rounded-full border transition",
+                  color === c.value ? "border-slate-500 ring-2 ring-slate-300" : "border-slate-300 hover:border-slate-400"
+                )}
+                style={{ backgroundColor: c.value }}
+              />
+            ))}
+          </div>
         </label>
         {kind === "team" ? (
           <label className="block">

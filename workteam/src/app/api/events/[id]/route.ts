@@ -11,6 +11,9 @@ import { getUserContext } from "@/lib/user-context";
 import type { CalendarKind } from "@/types/calendar";
 
 const kindSchema = z.enum(["personal", "team", "announcement"]);
+const eventColorSchema = z
+  .enum(["#ffd4de", "#ffe6d5", "#fff3d7", "#e0f7d8", "#d8eeff", "#f3def9"])
+  .nullable();
 
 const isoDateTimeString = z
   .string()
@@ -34,6 +37,7 @@ const patchBodySchema = z
     startsAt: isoDateTimeString.optional(),
     endsAt: isoDateTimeString.optional(),
     kind: kindSchema.optional(),
+    color: eventColorSchema.optional(),
     departmentId: z.string().uuid().nullable().optional(),
     attendeeUserIds: z.preprocess(normalizeAttendeeUserIds, z.array(z.string().uuid()).max(50)).optional()
   })
@@ -68,6 +72,7 @@ type EventRow = {
   starts_at: Date;
   ends_at: Date;
   kind: CalendarKind;
+  color: string | null;
   department_id: string | null;
   attendee_user_ids: string[];
   created_by: string | null;
@@ -91,6 +96,7 @@ function mapEvent(row: EventRow, attendees: { id: string; name: string; email: s
     description: row.description,
     startsAt: row.starts_at.toISOString(),
     endsAt: row.ends_at.toISOString(),
+    color: row.color,
     kind: row.kind,
     departmentId: row.department_id,
     attendeeUserIds: row.attendee_user_ids ?? [],
@@ -123,6 +129,7 @@ export async function GET(_request: NextRequest, context: RouteCtx) {
       description,
       starts_at,
       ends_at,
+      color,
       kind,
       department_id::text,
       attendee_user_ids,
@@ -172,6 +179,7 @@ export async function PATCH(request: NextRequest, context: RouteCtx) {
       description,
       starts_at,
       ends_at,
+      color,
       kind,
       department_id::text,
       attendee_user_ids,
@@ -198,6 +206,9 @@ export async function PATCH(request: NextRequest, context: RouteCtx) {
   }
   if (!canUserEditEvent(ctx, existing.created_by)) {
     return NextResponse.json({ message: "수정 권한이 없습니다." }, { status: 403 });
+  }
+  if (existing.kind === "announcement" && ctx.role !== "admin") {
+    return NextResponse.json({ message: "전사 공지는 관리자만 수정할 수 있습니다." }, { status: 403 });
   }
 
   let body: unknown;
@@ -236,6 +247,10 @@ export async function PATCH(request: NextRequest, context: RouteCtx) {
   if (data.kind !== undefined) {
     fields.push(`kind = $${pn++}`);
     values.push(data.kind);
+  }
+  if (data.color !== undefined) {
+    fields.push(`color = $${pn++}`);
+    values.push(data.color);
   }
   if (data.departmentId !== undefined) {
     const nextKind = data.kind ?? existing.kind;
@@ -284,6 +299,7 @@ export async function PATCH(request: NextRequest, context: RouteCtx) {
       description,
       starts_at,
       ends_at,
+      color,
       kind,
       department_id::text,
       attendee_user_ids,
@@ -349,6 +365,9 @@ export async function DELETE(_request: NextRequest, context: RouteCtx) {
   }
   if (!canUserEditEvent(ctx, row.created_by)) {
     return NextResponse.json({ message: "삭제 권한이 없습니다." }, { status: 403 });
+  }
+  if (row.kind === "announcement" && ctx.role !== "admin") {
+    return NextResponse.json({ message: "전사 공지는 관리자만 삭제할 수 있습니다." }, { status: 403 });
   }
 
   const result = await db.query(`DELETE FROM events WHERE id = $1::uuid RETURNING id`, [id]);

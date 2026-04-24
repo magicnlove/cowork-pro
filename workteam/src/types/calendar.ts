@@ -6,6 +6,7 @@ export type CalendarEvent = {
   description: string | null;
   startsAt: string;
   endsAt: string;
+  color: string | null;
   kind: CalendarKind;
   departmentId: string | null;
   attendeeUserIds: string[];

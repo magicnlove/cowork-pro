@@ -1,4 +1,4 @@
-export const dynamic = "force-dynamic";
+﻿export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 import { DatabaseError } from "pg";
@@ -11,6 +11,9 @@ import { getUserContext } from "@/lib/user-context";
 import type { CalendarKind } from "@/types/calendar";
 
 const kindSchema = z.enum(["personal", "team", "announcement"]);
+const eventColorSchema = z
+  .enum(["#ffd4de", "#ffe6d5", "#fff3d7", "#e0f7d8", "#d8eeff", "#f3def9"])
+  .nullable();
 
 /** ISO·로컬 등 Date.parse로 해석 가능한 문자열 (node-pg timestamptz와 호환) */
 const isoDateTimeString = z
@@ -35,6 +38,7 @@ const postBodySchema = z
     startsAt: isoDateTimeString,
     endsAt: isoDateTimeString,
     kind: kindSchema,
+    color: eventColorSchema.optional(),
     departmentId: z.string().uuid().nullable().optional(),
     attendeeUserIds: z.preprocess(normalizeAttendeeUserIds, z.array(z.string().uuid()).max(50)).optional()
   })
@@ -84,6 +88,7 @@ type EventRow = {
   starts_at: Date;
   ends_at: Date;
   kind: CalendarKind;
+  color: string | null;
   department_id: string | null;
   attendee_user_ids: string[];
   created_by: string | null;
@@ -107,6 +112,7 @@ function mapEvent(row: EventRow, attendees: { id: string; name: string; email: s
     description: row.description,
     startsAt: row.starts_at.toISOString(),
     endsAt: row.ends_at.toISOString(),
+    color: row.color,
     kind: row.kind,
     departmentId: row.department_id,
     attendeeUserIds: row.attendee_user_ids ?? [],
@@ -126,8 +132,12 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const from = searchParams.get("from");
   const to = searchParams.get("to");
+  const departmentId = searchParams.get("departmentId")?.trim() || null;
   if (!from || !to) {
     return NextResponse.json({ message: "from, to 쿼리가 필요합니다 (YYYY-MM-DD)." }, { status: 400 });
+  }
+  if (departmentId && !/^[0-9a-fA-F-]{36}$/.test(departmentId)) {
+    return NextResponse.json({ message: "departmentId 형식이 올바르지 않습니다." }, { status: 400 });
   }
 
   const rangeStart = `${from}T00:00:00.000Z`;
@@ -143,20 +153,37 @@ export async function GET(request: NextRequest) {
   let filterSql = "";
   const filterParams: unknown[] = [rangeStart, rangeEndExclusive];
   if (ctx.role === "admin") {
-    filterSql = `
-      (e.kind = 'announcement'
-        OR (e.kind = 'personal' AND (e.created_by = $3::uuid OR $3::uuid = ANY(e.attendee_user_ids)))
-        OR (e.kind = 'team'))
-    `;
-    filterParams.push(ctx.id);
+    if (departmentId) {
+      filterSql = `
+        (e.kind = 'team' AND e.department_id = $3::uuid)
+      `;
+      filterParams.push(departmentId);
+    } else {
+      filterSql = `
+        (e.kind = 'announcement'
+          OR (e.kind = 'personal' AND (e.created_by = $3::uuid OR $3::uuid = ANY(e.attendee_user_ids)))
+          OR (e.kind = 'team'))
+      `;
+      filterParams.push(ctx.id);
+    }
   } else {
     const scope = await getVisibleDepartmentIds(ctx);
-    filterSql = `
-      (e.kind = 'announcement'
-        OR (e.kind = 'personal' AND (e.created_by = $3::uuid OR $3::uuid = ANY(e.attendee_user_ids)))
-        OR (e.kind = 'team' AND e.department_id IS NOT NULL AND e.department_id = ANY($4::uuid[])))
-    `;
-    filterParams.push(ctx.id, scope);
+    if (departmentId && !scope.includes(departmentId)) {
+      return NextResponse.json({ message: "해당 부서 조회 권한이 없습니다." }, { status: 403 });
+    }
+    if (departmentId) {
+      filterSql = `
+        (e.kind = 'team' AND e.department_id = $3::uuid)
+      `;
+      filterParams.push(departmentId);
+    } else {
+      filterSql = `
+        (e.kind = 'announcement'
+          OR (e.kind = 'personal' AND (e.created_by = $3::uuid OR $3::uuid = ANY(e.attendee_user_ids)))
+          OR (e.kind = 'team' AND e.department_id IS NOT NULL AND e.department_id = ANY($4::uuid[])))
+      `;
+      filterParams.push(ctx.id, scope);
+    }
   }
 
   const result = await db.query<EventRow>(
@@ -167,6 +194,7 @@ export async function GET(request: NextRequest) {
       e.description,
       e.starts_at,
       e.ends_at,
+      e.color,
       e.kind,
       e.department_id::text,
       e.attendee_user_ids,
@@ -223,11 +251,15 @@ export async function POST(request: NextRequest) {
     startsAt,
     endsAt,
     kind,
+    color = null,
     departmentId = null,
     attendeeUserIds = []
   } = parsed.data;
 
   const departmentForDb = kind === "team" ? departmentId : null;
+  if (kind === "announcement" && ctx.role !== "admin") {
+    return NextResponse.json({ message: "전사 공지는 관리자만 등록할 수 있습니다." }, { status: 403 });
+  }
   if (kind === "team" && departmentForDb && !(await isDepartmentIdInScope(ctx, departmentForDb))) {
     return NextResponse.json({ message: "선택한 부서에 일정을 등록할 권한이 없습니다." }, { status: 403 });
   }
@@ -275,7 +307,7 @@ export async function POST(request: NextRequest) {
     const insert = await db.query<EventRow>(
       `
       INSERT INTO events (
-        title, description, starts_at, ends_at, kind, department_id, attendee_user_ids, created_by
+        title, description, starts_at, ends_at, kind, color, department_id, attendee_user_ids, created_by
       )
       VALUES (
         $1,
@@ -283,9 +315,10 @@ export async function POST(request: NextRequest) {
         $3::timestamptz,
         $4::timestamptz,
         $5,
-        $6::uuid,
-        COALESCE($7::uuid[], ARRAY[]::uuid[]),
-        $8::uuid
+        $6,
+        $7::uuid,
+        COALESCE($8::uuid[], ARRAY[]::uuid[]),
+        $9::uuid
       )
       RETURNING
         id,
@@ -293,6 +326,7 @@ export async function POST(request: NextRequest) {
         description,
         starts_at,
         ends_at,
+        color,
         kind,
         department_id::text,
         attendee_user_ids,
@@ -300,7 +334,7 @@ export async function POST(request: NextRequest) {
         created_at,
         updated_at
       `,
-      [title, description, startsAt, endsAt, kind, departmentForDb, attendeeParam, createdByUserId]
+      [title, description, startsAt, endsAt, kind, color, departmentForDb, attendeeParam, createdByUserId]
     );
 
     const row = insert.rows[0];

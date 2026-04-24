@@ -97,7 +97,13 @@ export async function GET(_request: NextRequest) {
             AND (
               kind = 'announcement'
               OR (kind = 'personal' AND (created_by = $3::uuid OR $3::uuid = ANY(attendee_user_ids)))
-              OR (kind = 'team' AND department_id IS NOT NULL AND department_id = ANY($4::uuid[]))
+              OR (
+                kind = 'team'
+                AND (
+                  $3::uuid = ANY(attendee_user_ids)
+                  OR (department_id IS NOT NULL AND department_id = ANY($4::uuid[]))
+                )
+              )
             )
           ORDER BY starts_at ASC
           LIMIT 5

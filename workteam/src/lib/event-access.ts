@@ -20,6 +20,10 @@ export async function canUserSeeEvent(ctx: UserContext, row: EventScopeRow): Pro
     return ids.includes(ctx.id);
   }
   if (row.kind === "team") {
+    const ids = row.attendee_user_ids ?? [];
+    if (ids.includes(ctx.id)) {
+      return true;
+    }
     if (!row.department_id) {
       return ctx.role === "admin";
     }

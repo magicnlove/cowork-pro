@@ -313,8 +313,14 @@ export async function POST(request: NextRequest) {
   } catch (e) {
     await db.query(`DELETE FROM messages WHERE id = $1::uuid`, [messageId]);
     const code = e instanceof Error ? e.message : "";
-    if (code === "bad_ext" || code === "unsupported_type" || code === "too_large") {
-      return NextResponse.json({ message: "파일을 첨부할 수 없습니다." }, { status: 400 });
+    if (code === "bad_ext") {
+      return NextResponse.json({ message: "파일 확장자가 필요합니다." }, { status: 400 });
+    }
+    if (code === "unsupported_type") {
+      return NextResponse.json({ message: "허용되지 않은 형식입니다." }, { status: 400 });
+    }
+    if (code === "too_large") {
+      return NextResponse.json({ message: "파일이 너무 큽니다." }, { status: 400 });
     }
     console.error("[POST chat/messages]", e);
     return NextResponse.json({ message: "첨부 저장에 실패했습니다." }, { status: 500 });

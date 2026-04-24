@@ -11,6 +11,7 @@ import type { DocumentCommentDTO, DocumentDetailDTO, DocumentVersionDTO } from "
 import type { FileAttachmentDTO } from "@/types/files";
 import { ArchiveWorkspaceMembersPanel } from "@/components/archive/archive-workspace-members";
 import { ROLE_LABEL } from "@/components/archive/archive-ui-helpers";
+import { AttachmentList } from "@/components/files/attachment-list";
 
 const ROOT_FOLDERS = [
   { value: "in_progress", label: "진행 중" },
@@ -170,8 +171,11 @@ export function ArchiveDocumentDetail({
   });
 
   const [uploadBusy, setUploadBusy] = useState(false);
+  const [fileErr, setFileErr] = useState<string | null>(null);
+  const [deletingFileId, setDeletingFileId] = useState<string | null>(null);
   async function uploadFile(file: File) {
     setUploadBusy(true);
+    setFileErr(null);
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -183,8 +187,24 @@ export function ArchiveDocumentDetail({
         throw new Error(j.message ?? "업로드 실패");
       }
       await qc.invalidateQueries({ queryKey: ["document-attachments", documentId] });
+    } catch (e) {
+      setFileErr(e instanceof Error ? e.message : "업로드에 실패했습니다.");
     } finally {
       setUploadBusy(false);
+    }
+  }
+
+  async function deleteFile(att: FileAttachmentDTO) {
+    if (!window.confirm(`'${att.originalName}' 파일을 삭제할까요?`)) return;
+    setDeletingFileId(att.id);
+    setFileErr(null);
+    try {
+      await fetchJson(`/api/files/${encodeURIComponent(att.id)}`, { method: "DELETE" });
+      await qc.invalidateQueries({ queryKey: ["document-attachments", documentId] });
+    } catch (e) {
+      setFileErr(e instanceof Error ? e.message : "파일 삭제에 실패했습니다.");
+    } finally {
+      setDeletingFileId(null);
     }
   }
 
@@ -401,25 +421,17 @@ export function ArchiveDocumentDetail({
             />
           </label>
         )}
-        <ul className="mt-3 space-y-2 text-xs">
-          {(filesQ.data ?? []).map((a) => (
-            <li key={a.id} className="flex flex-wrap items-center justify-between gap-2">
-              <a
-                href={a.url}
-                className="font-medium text-brand-700 underline-offset-2 hover:underline"
-                target="_blank"
-                rel="noreferrer"
-              >
-                {a.originalName}
-              </a>
-              <span className="text-slate-400">{(a.byteSize / 1024).toFixed(1)} KB</span>
-            </li>
-          ))}
-          {filesQ.isLoading && <li className="text-slate-500">불러오는 중…</li>}
-          {!filesQ.isLoading && (filesQ.data?.length ?? 0) === 0 && (
-            <li className="text-slate-500">첨부된 파일이 없습니다.</li>
-          )}
-        </ul>
+        <AttachmentList
+          attachments={filesQ.data ?? []}
+          canDelete={canEdit}
+          deletingId={deletingFileId}
+          onDelete={(a) => void deleteFile(a)}
+        />
+        {fileErr ? <p className="mt-2 text-xs text-rose-600">{fileErr}</p> : null}
+        {filesQ.isLoading && <p className="mt-2 text-xs text-slate-500">불러오는 중…</p>}
+        {!filesQ.isLoading && (filesQ.data?.length ?? 0) === 0 && (
+          <p className="mt-2 text-xs text-slate-500">첨부된 파일이 없습니다.</p>
+        )}
       </div>
 
       <div className="rounded-xl border border-slate-200 p-3">

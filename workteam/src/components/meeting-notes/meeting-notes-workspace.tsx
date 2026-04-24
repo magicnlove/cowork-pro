@@ -110,6 +110,8 @@ export function MeetingNotesWorkspace() {
   const [userQuery, setUserQuery] = useState("");
   const [mentionOpen, setMentionOpen] = useState<MentionOpen | null>(null);
   const [files, setFiles] = useState<FileAttachmentDTO[]>([]);
+  const [uploadErr, setUploadErr] = useState<string | null>(null);
+  const [deletingFileId, setDeletingFileId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
@@ -316,16 +318,41 @@ export function MeetingNotesWorkspace() {
     if (!selectedId) {
       return;
     }
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("entityType", "meeting_note");
-    fd.append("entityId", selectedId);
-    const res = await fetch("/api/files", { method: "POST", body: fd, credentials: "include" });
-    if (res.ok) {
+    setUploadErr(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("entityType", "meeting_note");
+      fd.append("entityId", selectedId);
+      const res = await fetch("/api/files", { method: "POST", body: fd, credentials: "include" });
+      if (!res.ok) {
+        const j = (await res.json()) as { message?: string };
+        throw new Error(j.message ?? "업로드에 실패했습니다.");
+      }
       const f = await fetchJson<{ attachments: FileAttachmentDTO[] }>(
         `/api/files?entityType=meeting_note&entityId=${encodeURIComponent(selectedId)}`
       );
       setFiles(f.attachments);
+    } catch (e) {
+      setUploadErr(e instanceof Error ? e.message : "업로드에 실패했습니다.");
+    }
+  }
+
+  async function deleteFile(att: FileAttachmentDTO) {
+    if (!selectedId) return;
+    if (!window.confirm(`'${att.originalName}' 파일을 삭제할까요?`)) return;
+    setUploadErr(null);
+    setDeletingFileId(att.id);
+    try {
+      await fetchJson(`/api/files/${encodeURIComponent(att.id)}`, { method: "DELETE" });
+      const f = await fetchJson<{ attachments: FileAttachmentDTO[] }>(
+        `/api/files?entityType=meeting_note&entityId=${encodeURIComponent(selectedId)}`
+      );
+      setFiles(f.attachments);
+    } catch (e) {
+      setUploadErr(e instanceof Error ? e.message : "파일 삭제에 실패했습니다.");
+    } finally {
+      setDeletingFileId(null);
     }
   }
 
@@ -762,7 +789,12 @@ export function MeetingNotesWorkspace() {
                 <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                   첨부 파일
                 </p>
-                <AttachmentList attachments={files} />
+                <AttachmentList
+                  attachments={files}
+                  canDelete
+                  deletingId={deletingFileId}
+                  onDelete={(a) => void deleteFile(a)}
+                />
                 <label className="mt-2 inline-flex cursor-pointer rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-2 text-xs text-slate-600 hover:bg-slate-100">
                   <input
                     type="file"
@@ -778,6 +810,9 @@ export function MeetingNotesWorkspace() {
                   />
                   파일 업로드
                 </label>
+                {uploadErr ? (
+                  <p className="mt-2 text-xs text-rose-600">{uploadErr}</p>
+                ) : null}
               </div>
             </div>
           </>

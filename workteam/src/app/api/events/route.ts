@@ -225,19 +225,20 @@ export async function GET(request: NextRequest) {
     }
   } else {
     const scope = await getVisibleDepartmentIds(ctx);
-    if (departmentId && !scope.includes(departmentId)) {
-      return NextResponse.json({ message: "해당 부서 조회 권한이 없습니다." }, { status: 403 });
-    }
     if (departmentId) {
       filterSql = `
-        (e.kind = 'team' AND e.department_id = $3::uuid)
+        (e.kind = 'team' AND e.department_id = $3::uuid
+          AND ($4::uuid = ANY(e.attendee_user_ids) OR e.department_id = ANY($5::uuid[])))
       `;
-      filterParams.push(departmentId);
+      filterParams.push(departmentId, ctx.id, scope);
     } else {
       filterSql = `
         (e.kind = 'announcement'
           OR (e.kind = 'personal' AND (e.created_by = $3::uuid OR $3::uuid = ANY(e.attendee_user_ids)))
-          OR (e.kind = 'team' AND e.department_id IS NOT NULL AND e.department_id = ANY($4::uuid[])))
+          OR (e.kind = 'team' AND (
+            $3::uuid = ANY(e.attendee_user_ids)
+            OR (e.department_id IS NOT NULL AND e.department_id = ANY($4::uuid[]))
+          )))
       `;
       filterParams.push(ctx.id, scope);
     }

@@ -136,7 +136,10 @@ function MessageBubble({
   isPinned,
   showPinInMenu,
   menuOpen,
-  onToggleMenu
+  onToggleMenu,
+  canDeleteAttachments,
+  deletingAttachmentId,
+  onDeleteAttachment
 }: {
   message: ChatMessageDTO;
   isMine: boolean;
@@ -160,6 +163,9 @@ function MessageBubble({
   showPinInMenu: boolean;
   menuOpen: boolean;
   onToggleMenu: () => void;
+  canDeleteAttachments?: boolean;
+  deletingAttachmentId?: string | null;
+  onDeleteAttachment?: (attachment: { id: string; originalName: string }) => void;
 }) {
   const time = dayjs(message.createdAt).format("A h:mm");
   const deleted = Boolean(message.deletedAt);
@@ -243,7 +249,13 @@ function MessageBubble({
             </div>
             {!deleted && (message.attachments?.length ?? 0) > 0 ? (
               <div className={clsx(isMine && "flex justify-end")}>
-                <AttachmentList attachments={message.attachments ?? []} compact />
+                <AttachmentList
+                  attachments={message.attachments ?? []}
+                  compact
+                  canDelete={Boolean(canDeleteAttachments && onDeleteAttachment)}
+                  deletingId={deletingAttachmentId ?? null}
+                  onDelete={onDeleteAttachment ? (a) => onDeleteAttachment(a) : undefined}
+                />
               </div>
             ) : null}
           </>
@@ -393,6 +405,7 @@ export function ChatWorkspace() {
   const threadFileInputRef = useRef<HTMLInputElement | null>(null);
   const [slashOpen, setSlashOpen] = useState(false);
   const [socketError, setSocketError] = useState<string | null>(null);
+  const [deletingAttachmentId, setDeletingAttachmentId] = useState<string | null>(null);
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
@@ -957,6 +970,38 @@ export function ChatWorkspace() {
       setSocketError(e instanceof Error ? e.message : "삭제에 실패했습니다.");
     }
   }, []);
+
+  const onDeleteAttachment = useCallback(
+    async (message: ChatMessageDTO, attachment: { id: string; originalName: string }) => {
+      if (!window.confirm(`'${attachment.originalName}' 파일을 삭제할까요?`)) return;
+      setDeletingAttachmentId(attachment.id);
+      try {
+        await fetchJson(`/api/files/${encodeURIComponent(attachment.id)}`, { method: "DELETE" });
+        if (message.parentMessageId) {
+          setThreadMessages((prev) =>
+            prev.map((m) =>
+              m.id === message.id
+                ? { ...m, attachments: (m.attachments ?? []).filter((a) => a.id !== attachment.id) }
+                : m
+            )
+          );
+        } else {
+          setMainMessages((prev) =>
+            prev.map((m) =>
+              m.id === message.id
+                ? { ...m, attachments: (m.attachments ?? []).filter((a) => a.id !== attachment.id) }
+                : m
+            )
+          );
+        }
+      } catch (e) {
+        setSocketError(e instanceof Error ? e.message : "파일 삭제에 실패했습니다.");
+      } finally {
+        setDeletingAttachmentId(null);
+      }
+    },
+    []
+  );
 
   const saveEdit = useCallback(async () => {
     if (!editingId) {
@@ -1537,6 +1582,9 @@ export function ChatWorkspace() {
                   onToggleMenu={() =>
                     setOpenMessageMenuId((prev) => (prev === m.id ? null : m.id))
                   }
+                  canDeleteAttachments={me?.id === m.userId}
+                  deletingAttachmentId={deletingAttachmentId}
+                  onDeleteAttachment={(a) => void onDeleteAttachment(m, a)}
                 />
                 );
               })}
@@ -1692,6 +1740,9 @@ export function ChatWorkspace() {
                     onToggleMenu={() =>
                       setOpenMessageMenuId((prev) => (prev === m.id ? null : m.id))
                     }
+                    canDeleteAttachments={me?.id === m.userId}
+                    deletingAttachmentId={deletingAttachmentId}
+                    onDeleteAttachment={(a) => void onDeleteAttachment(m, a)}
                   />
                   );
                 })}

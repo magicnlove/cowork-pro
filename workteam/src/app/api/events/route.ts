@@ -105,6 +105,27 @@ async function resolveAttendees(userIds: string[]) {
   return res.rows;
 }
 
+async function resolveAttendeesMap(rows: EventRow[]) {
+  const idSet = new Set<string>();
+  for (const row of rows) {
+    for (const uid of row.attendee_user_ids ?? []) idSet.add(uid);
+  }
+  const allIds = [...idSet];
+  if (allIds.length === 0) return new Map<string, { id: string; name: string; email: string }[]>();
+  const users = await resolveAttendees(allIds);
+  const byId = new Map(users.map((u) => [u.id, u] as const));
+  const out = new Map<string, { id: string; name: string; email: string }[]>();
+  for (const row of rows) {
+    const attendees = (row.attendee_user_ids ?? []).map((id) => byId.get(id)).filter(Boolean) as {
+      id: string;
+      name: string;
+      email: string;
+    }[];
+    out.set(row.id, attendees);
+  }
+  return out;
+}
+
 function mapEvent(row: EventRow, attendees: { id: string; name: string; email: string }[]) {
   return {
     id: row.id,
@@ -209,11 +230,8 @@ export async function GET(request: NextRequest) {
     filterParams
   );
 
-  const events = [];
-  for (const row of result.rows) {
-    const attendees = await resolveAttendees(row.attendee_user_ids ?? []);
-    events.push(mapEvent(row, attendees));
-  }
+  const attendeeMap = await resolveAttendeesMap(result.rows);
+  const events = result.rows.map((row) => mapEvent(row, attendeeMap.get(row.id) ?? []));
 
   return NextResponse.json({ events });
 }

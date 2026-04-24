@@ -1359,9 +1359,10 @@ function EventFormModal({
       .slice(0, 80);
   }, [attendeeQuery, defaultDepartmentId, users]);
 
+  /** 생성: 항상 시작·종료 일자 선택 가능. 편집: 달력상 여러 날인 일정만 종료 일자 필드 표시 */
   const showEndDate =
     mode === "create"
-      ? Boolean(initialDateRange && initialDateRange.startDate !== initialDateRange.endDate)
+      ? true
       : Boolean(
           event &&
             dayjs(event.endsAt).format("YYYY-MM-DD") !== dayjs(event.startsAt).format("YYYY-MM-DD")

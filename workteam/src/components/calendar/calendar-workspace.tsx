@@ -47,6 +47,71 @@ function eventTouchesDay(ev: CalendarEvent, day: dayjs.Dayjs): boolean {
   return dayjs(ev.startsAt).isBefore(d1) && dayjs(ev.endsAt).isAfter(d0);
 }
 
+/** 달력상 여러 날에 걸친 일정 (가로 바 전용; 당일 일정은 칩 유지) */
+function isMultiDayCalendarEvent(ev: CalendarEvent): boolean {
+  return dayjs(ev.endsAt).startOf("day").isAfter(dayjs(ev.startsAt).startOf("day"));
+}
+
+/** 일정이 마지막으로 걸치는 달의 날(시작일과 같을 수 있음) */
+function eventCalendarLastDay(ev: CalendarEvent): dayjs.Dayjs {
+  let d = dayjs(ev.startsAt).startOf("day");
+  let last = d;
+  for (let n = 0; n < 400; n++) {
+    if (!eventTouchesDay(ev, d)) break;
+    last = d;
+    d = d.add(1, "day");
+  }
+  return last;
+}
+
+const SPAN_BAR_H = 18;
+const SPAN_BAR_GAP = 2;
+
+type WeekSpanSegment = { ev: CalendarEvent; col0: number; col1: number; lane: number };
+
+/** 한 주(7칸) 안에서 다중일 일정 가로 바 레이어: 겹치면 lane 증가 */
+function layoutWeekSpanSegments(weekDays: dayjs.Dayjs[], allEvents: CalendarEvent[]): { segments: WeekSpanSegment[]; laneCount: number } {
+  const raw: { ev: CalendarEvent; col0: number; col1: number }[] = [];
+  for (const ev of allEvents) {
+    if (!isMultiDayCalendarEvent(ev)) continue;
+    let col0 = -1;
+    for (let i = 0; i < 7; i++) {
+      if (eventTouchesDay(ev, weekDays[i])) {
+        col0 = i;
+        break;
+      }
+    }
+    if (col0 < 0) continue;
+    let col1 = col0;
+    for (let i = 6; i >= col0; i--) {
+      if (eventTouchesDay(ev, weekDays[i])) {
+        col1 = i;
+        break;
+      }
+    }
+    raw.push({ ev, col0, col1 });
+  }
+  raw.sort((a, b) => a.col0 - b.col0 || a.col1 - b.col1 || a.ev.id.localeCompare(b.ev.id));
+  const laneEnds: number[] = [];
+  const segments: WeekSpanSegment[] = [];
+  for (const s of raw) {
+    let lane = -1;
+    for (let i = 0; i < laneEnds.length; i++) {
+      if (laneEnds[i] < s.col0) {
+        lane = i;
+        laneEnds[i] = s.col1;
+        break;
+      }
+    }
+    if (lane < 0) {
+      lane = laneEnds.length;
+      laneEnds.push(s.col1);
+    }
+    segments.push({ ...s, lane });
+  }
+  return { segments, laneCount: laneEnds.length };
+}
+
 /** 월 그리드: 포인터 아래의 `data-month-day`(YYYY-MM-DD) 셀 키 */
 function monthDayKeyFromPoint(clientX: number, clientY: number): string | null {
   const el = document.elementFromPoint(clientX, clientY);
@@ -167,6 +232,50 @@ function DraggableEventChip({
           <span className="min-w-0 text-xs font-semibold leading-snug">{ev.title}</span>
         </>
       )}
+    </button>
+  );
+}
+
+/** 월/주 상단 가로 바: 여러 날에 걸친 일정 전용 (한 주 구간 내 한 덩어리) */
+function DraggableSpanBar({
+  dragId,
+  event: ev,
+  onClick,
+  roundedLeft,
+  roundedRight
+}: {
+  /** 주·월에서 동일 일정이 여러 행에 있을 수 있어 고유 id 필요 (`span|…`) */
+  dragId: string;
+  event: CalendarEvent;
+  onClick: (e: CalendarEvent) => void;
+  roundedLeft: boolean;
+  roundedRight: boolean;
+}) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: dragId,
+    data: { event: ev }
+  });
+  const tStyle = transform ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` } : undefined;
+  return (
+    <button
+      type="button"
+      ref={setNodeRef}
+      style={tStyle}
+      {...listeners}
+      {...attributes}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick(ev);
+      }}
+      className={clsx(
+        "box-border h-full min-h-0 w-full truncate border border-black/[0.06] px-1.5 text-left text-[10px] font-semibold leading-[16px] shadow-sm transition hover:brightness-[0.98]",
+        kindStyle(ev.kind),
+        roundedLeft && "rounded-l-md",
+        roundedRight && "rounded-r-md",
+        isDragging && "opacity-40"
+      )}
+    >
+      {ev.title}
     </button>
   );
 }
@@ -726,6 +835,14 @@ export function CalendarWorkspace() {
     return cells;
   }, [cursor]);
 
+  const monthWeeks = useMemo(() => {
+    const rows: dayjs.Dayjs[][] = [];
+    for (let i = 0; i < monthCells.length; i += 7) {
+      rows.push(monthCells.slice(i, i + 7));
+    }
+    return rows;
+  }, [monthCells]);
+
   const weekDays = useMemo(() => {
     const start = cursor.startOf("isoWeek");
     return Array.from({ length: 7 }, (_, i) => start.add(i, "day"));
@@ -857,8 +974,9 @@ export function CalendarWorkspace() {
     if (!oid.startsWith("day-")) return;
     const dayKey = oid.slice(4);
     const targetDay = dayjs(dayKey);
-    const id = String(active.id).replace("evt-", "");
-    const ev = displayEvents.find((x) => x.id === id);
+    const raw = String(active.id);
+    const eventId = raw.startsWith("span|") ? (raw.split("|")[1] ?? "") : raw.replace("evt-", "");
+    const ev = displayEvents.find((x) => x.id === eventId);
     if (!ev) return;
     if (dayjs(ev.startsAt).isSame(targetDay, "day")) return;
     const next = moveEventToNewDay(ev, targetDay);
@@ -969,85 +1087,125 @@ export function CalendarWorkspace() {
                   </div>
                 ))}
               </div>
-              <div className="grid grid-cols-7">
-                {monthCells.map((day) => {
-                  const key = day.format("YYYY-MM-DD");
-                  const inMonth = day.month() === cursor.month();
-                  const today = day.isSame(dayjs(), "day");
-                  const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, day));
-                  const dragLo =
-                    monthRangeDrag &&
-                    (monthRangeDrag.anchor <= monthRangeDrag.hover
-                      ? monthRangeDrag.anchor
-                      : monthRangeDrag.hover);
-                  const dragHi =
-                    monthRangeDrag &&
-                    (monthRangeDrag.anchor <= monthRangeDrag.hover
-                      ? monthRangeDrag.hover
-                      : monthRangeDrag.anchor);
-                  const rangeHighlight = Boolean(monthRangeDrag && dragLo && dragHi && key >= dragLo && key <= dragHi);
-                  return (
-                    <DroppableDayCell
-                      key={key}
-                      dayKey={key}
-                      isToday={today}
-                      muted={!inMonth}
-                      rangeHighlight={rangeHighlight}
-                    >
-                      <div className="relative flex min-h-[84px] flex-col">
-                        <div
-                          role="presentation"
-                          data-month-day={key}
-                          className={clsx(
-                            "absolute inset-0 z-0 touch-none select-none",
-                            createOpen ? "pointer-events-none" : "cursor-crosshair"
-                          )}
-                          onPointerDown={(e) => onMonthGridCellPointerDown(key, e)}
-                        />
-                        <div className="pointer-events-none relative z-[1] flex min-h-0 flex-1 flex-col">
-                          <div className="mb-1 flex justify-between">
-                            <span
-                              className={clsx(
-                                "text-sm font-medium",
-                                today
-                                  ? "flex h-7 w-7 items-center justify-center rounded-full bg-blue-600 text-white"
-                                  : "text-slate-800"
-                              )}
+              {monthWeeks.map((week, weekIdx) => {
+                const { segments, laneCount } = layoutWeekSpanSegments(week, displayEvents);
+                const stripPad = 4;
+                const stripMinH = laneCount > 0 ? laneCount * (SPAN_BAR_H + SPAN_BAR_GAP) + stripPad : 0;
+                return (
+                  <div key={week[0].format("YYYY-MM-DD")} className="grid grid-cols-7 border-b border-slate-200 last:border-b-0">
+                    {laneCount > 0 ? (
+                      <div
+                        className="relative col-span-7 box-border border-x border-slate-200/90 bg-white"
+                        style={{ minHeight: stripMinH }}
+                      >
+                        {segments.map((s) => {
+                          const lastD = eventCalendarLastDay(s.ev);
+                          const isSegStart = week[s.col0].isSame(dayjs(s.ev.startsAt), "day");
+                          const isSegEnd = week[s.col1].isSame(lastD, "day");
+                          const leftPct = (s.col0 / 7) * 100;
+                          const widthPct = ((s.col1 - s.col0 + 1) / 7) * 100;
+                          const top = stripPad / 2 + s.lane * (SPAN_BAR_H + SPAN_BAR_GAP);
+                          return (
+                            <div
+                              key={`${s.ev.id}-w${weekIdx}`}
+                              className="pointer-events-auto absolute box-border px-[1px]"
+                              style={{ left: `${leftPct}%`, width: `${widthPct}%`, top, height: SPAN_BAR_H }}
                             >
-                              {day.date()}
-                            </span>
-                            {inMonth && (
-                              <button
-                                type="button"
-                                className="pointer-events-auto text-xs text-brand-600 hover:underline"
-                                onClick={() => {
-                                  setCreateDate(key);
-                                  setCreateDateRange(null);
-                                  setCreateTimeRange(null);
-                                  setCreateModalKey((k) => k + 1);
-                                  setCreateOpen(true);
-                                }}
-                              >
-                                +
-                              </button>
-                            )}
-                          </div>
-                          <div className="flex max-h-[72px] flex-col gap-0.5 overflow-hidden">
-                            {dayEvents.slice(0, 3).map((ev) => (
-                              <DraggableEventChip key={ev.id} event={ev} compact onClick={setDetail} />
-                            ))}
-                            {dayEvents.length > 3 && (
-                              <span className="truncate pl-1 text-[10px] text-slate-500">
-                                +{dayEvents.length - 3}건
-                              </span>
-                            )}
-                          </div>
-                        </div>
+                              <DraggableSpanBar
+                                dragId={`span|${s.ev.id}|m${weekIdx}-${week[0].format("YYYY-MM-DD")}`}
+                                event={s.ev}
+                                onClick={setDetail}
+                                roundedLeft={isSegStart}
+                                roundedRight={isSegEnd}
+                              />
+                            </div>
+                          );
+                        })}
                       </div>
-                    </DroppableDayCell>
-                  );
-                })}
-              </div>
+                    ) : null}
+                    {week.map((day) => {
+                      const key = day.format("YYYY-MM-DD");
+                      const inMonth = day.month() === cursor.month();
+                      const today = day.isSame(dayjs(), "day");
+                      const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, day));
+                      const chipEvents = dayEvents.filter((ev) => !isMultiDayCalendarEvent(ev));
+                      const dragLo =
+                        monthRangeDrag &&
+                        (monthRangeDrag.anchor <= monthRangeDrag.hover
+                          ? monthRangeDrag.anchor
+                          : monthRangeDrag.hover);
+                      const dragHi =
+                        monthRangeDrag &&
+                        (monthRangeDrag.anchor <= monthRangeDrag.hover
+                          ? monthRangeDrag.hover
+                          : monthRangeDrag.anchor);
+                      const rangeHighlight = Boolean(
+                        monthRangeDrag && dragLo && dragHi && key >= dragLo && key <= dragHi
+                      );
+                      return (
+                        <DroppableDayCell
+                          key={key}
+                          dayKey={key}
+                          isToday={today}
+                          muted={!inMonth}
+                          rangeHighlight={rangeHighlight}
+                        >
+                          <div className="relative flex min-h-[84px] flex-col">
+                            <div
+                              role="presentation"
+                              data-month-day={key}
+                              className={clsx(
+                                "absolute inset-0 z-0 touch-none select-none",
+                                createOpen ? "pointer-events-none" : "cursor-crosshair"
+                              )}
+                              onPointerDown={(e) => onMonthGridCellPointerDown(key, e)}
+                            />
+                            <div className="pointer-events-none relative z-[1] flex min-h-0 flex-1 flex-col">
+                              <div className="mb-1 flex justify-between">
+                                <span
+                                  className={clsx(
+                                    "text-sm font-medium",
+                                    today
+                                      ? "flex h-7 w-7 items-center justify-center rounded-full bg-blue-600 text-white"
+                                      : "text-slate-800"
+                                  )}
+                                >
+                                  {day.date()}
+                                </span>
+                                {inMonth && (
+                                  <button
+                                    type="button"
+                                    className="pointer-events-auto text-xs text-brand-600 hover:underline"
+                                    onClick={() => {
+                                      setCreateDate(key);
+                                      setCreateDateRange(null);
+                                      setCreateTimeRange(null);
+                                      setCreateModalKey((k) => k + 1);
+                                      setCreateOpen(true);
+                                    }}
+                                  >
+                                    +
+                                  </button>
+                                )}
+                              </div>
+                              <div className="flex max-h-[72px] flex-col gap-0.5 overflow-hidden">
+                                {chipEvents.slice(0, 3).map((ev) => (
+                                  <DraggableEventChip key={ev.id} event={ev} compact onClick={setDetail} />
+                                ))}
+                                {chipEvents.length > 3 && (
+                                  <span className="truncate pl-1 text-[10px] text-slate-500">
+                                    +{chipEvents.length - 3}건
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </DroppableDayCell>
+                      );
+                    })}
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -1079,6 +1237,48 @@ export function CalendarWorkspace() {
                   );
                 })}
               </div>
+              {(() => {
+                const { segments, laneCount } = layoutWeekSpanSegments(weekDays, displayEvents);
+                const stripPad = 4;
+                const stripMinH = laneCount > 0 ? laneCount * (SPAN_BAR_H + SPAN_BAR_GAP) + stripPad : 0;
+                return (
+                  <div className="grid grid-cols-8 border-b border-slate-200 bg-white">
+                    <div className="border-r border-slate-200 bg-slate-50/50" aria-hidden />
+                    {laneCount > 0 ? (
+                      <div
+                        className="relative col-span-7 box-border border-r border-slate-200/90"
+                        style={{ minHeight: stripMinH }}
+                      >
+                        {segments.map((s) => {
+                          const lastD = eventCalendarLastDay(s.ev);
+                          const isSegStart = weekDays[s.col0].isSame(dayjs(s.ev.startsAt), "day");
+                          const isSegEnd = weekDays[s.col1].isSame(lastD, "day");
+                          const leftPct = (s.col0 / 7) * 100;
+                          const widthPct = ((s.col1 - s.col0 + 1) / 7) * 100;
+                          const top = stripPad / 2 + s.lane * (SPAN_BAR_H + SPAN_BAR_GAP);
+                          return (
+                            <div
+                              key={`${s.ev.id}-weekspan`}
+                              className="pointer-events-auto absolute box-border px-[1px]"
+                              style={{ left: `${leftPct}%`, width: `${widthPct}%`, top, height: SPAN_BAR_H }}
+                            >
+                              <DraggableSpanBar
+                                dragId={`span|${s.ev.id}|${weekDays[0].format("YYYY-MM-DD")}`}
+                                event={s.ev}
+                                onClick={setDetail}
+                                roundedLeft={isSegStart}
+                                roundedRight={isSegEnd}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="col-span-7" />
+                    )}
+                  </div>
+                );
+              })()}
               <div className="relative grid grid-cols-8">
                 <div className="border-r border-slate-200 bg-slate-50/50 py-1 text-right text-[10px] text-slate-400">
                   {Array.from({ length: 24 }, (_, h) => (
@@ -1091,7 +1291,8 @@ export function CalendarWorkspace() {
                   const key = d.format("YYYY-MM-DD");
                   const today = d.isSame(dayjs(), "day");
                   const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, d));
-                  const stackMap = layoutTimedEventsStack(dayEvents, d);
+                  const timedDayEvents = dayEvents.filter((ev) => !isMultiDayCalendarEvent(ev));
+                  const stackMap = layoutTimedEventsStack(timedDayEvents, d);
                   return (
                     <DroppableDayCell key={key} dayKey={key} isToday={today} muted={false}>
                       <div className="relative min-h-[1152px] min-w-[120px]">
@@ -1101,7 +1302,7 @@ export function CalendarWorkspace() {
                           ))}
                         </div>
                         <div className="pointer-events-none absolute inset-0 z-[2]">
-                          {dayEvents.map((ev) => {
+                          {timedDayEvents.map((ev) => {
                             const start = dayjs(ev.startsAt);
                             const end = dayjs(ev.endsAt);
                             const dayStart = d.startOf("day");

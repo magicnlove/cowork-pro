@@ -1,7 +1,9 @@
-﻿export const dynamic = "force-dynamic";
+export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 import { DatabaseError } from "pg";
+import dayjs from "dayjs";
+import { randomUUID } from "crypto";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { createActivityLogSafe } from "@/lib/activity-log";
@@ -9,17 +11,23 @@ import { getVisibleDepartmentIds, isDepartmentIdInScope } from "@/lib/org-scope"
 import { getSessionFromRequest } from "@/lib/session";
 import { getUserContext } from "@/lib/user-context";
 import type { CalendarKind } from "@/types/calendar";
+import { expandRecurringStarts } from "@/lib/expand-recurring-starts";
+import { computeInstanceEndsAt } from "@/lib/recurring-instance-end";
 
 const kindSchema = z.enum(["personal", "team", "announcement"]);
 const eventColorSchema = z
   .enum(["#ffd4de", "#ffe6d5", "#fff3d7", "#e0f7d8", "#d8eeff", "#f3def9"])
   .nullable();
+const recurrenceTypeSchema = z.enum(["none", "daily", "weekly", "weekday", "monthly", "yearly"]);
 
 /** ISO·로컬 등 Date.parse로 해석 가능한 문자열 (node-pg timestamptz와 호환) */
 const isoDateTimeString = z
   .string()
   .min(1)
   .refine((s) => !Number.isNaN(Date.parse(s)), { message: "유효한 날짜·시간 형식이 아닙니다." });
+const ymdDateString = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, { message: "날짜 형식은 YYYY-MM-DD 이어야 합니다." });
 
 function normalizeAttendeeUserIds(raw: unknown): string[] {
   if (raw == null || raw === "") return [];
@@ -39,6 +47,17 @@ const postBodySchema = z
     endsAt: isoDateTimeString,
     kind: kindSchema,
     color: eventColorSchema.optional(),
+    recurrenceType: recurrenceTypeSchema.optional(),
+    recurrenceStartDate: ymdDateString.optional(),
+    recurrenceDays: z.array(z.number().int().min(1).max(7)).max(7).optional(),
+    recurrenceEndDate: z.preprocess(
+      (v) => (v === null || v === "" ? undefined : v),
+      ymdDateString.optional()
+    ),
+    recurrenceDetail: z.preprocess(
+      (v) => (v === null ? undefined : v),
+      z.record(z.string(), z.unknown()).optional()
+    ),
     departmentId: z.string().uuid().nullable().optional(),
     attendeeUserIds: z.preprocess(normalizeAttendeeUserIds, z.array(z.string().uuid()).max(50)).optional()
   })
@@ -56,6 +75,34 @@ const postBodySchema = z
         message: "팀 일정에만 부서를 지정할 수 있습니다.",
         path: ["departmentId"]
       });
+    }
+    if (data.recurrenceType && data.recurrenceType !== "none") {
+      if (!data.recurrenceEndDate) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "반복 종료일이 필요합니다.",
+          path: ["recurrenceEndDate"]
+        });
+      }
+      if (data.recurrenceType === "weekly" && (!data.recurrenceDays || data.recurrenceDays.length === 0)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "매주 반복은 요일 선택이 필요합니다.",
+          path: ["recurrenceDays"]
+        });
+      }
+      const startBase = data.recurrenceStartDate
+        ? `${data.recurrenceStartDate}T00:00:00.000Z`
+        : data.startsAt;
+      const startDate = new Date(startBase);
+      const endDate = new Date(`${data.recurrenceEndDate}T23:59:59.999Z`);
+      if (!Number.isNaN(startDate.getTime()) && !Number.isNaN(endDate.getTime()) && endDate <= startDate) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "반복 종료일은 시작일 이후여야 합니다.",
+          path: ["recurrenceEndDate"]
+        });
+      }
     }
   });
 
@@ -89,6 +136,11 @@ type EventRow = {
   ends_at: Date;
   kind: CalendarKind;
   color: string | null;
+  recurrence_type: "none" | "daily" | "weekly" | "weekday" | "monthly" | "yearly";
+  recurrence_days: string | null;
+  recurrence_end_date: string | null;
+  recurrence_detail: Record<string, unknown> | null;
+  recurrence_group_id: string | null;
   department_id: string | null;
   attendee_user_ids: string[];
   created_by: string | null;
@@ -169,6 +221,11 @@ function mapEvent(
     startsAt: row.starts_at.toISOString(),
     endsAt: row.ends_at.toISOString(),
     color: row.color,
+    recurrenceType: row.recurrence_type ?? "none",
+    recurrenceDays: row.recurrence_days,
+    recurrenceEndDate: row.recurrence_end_date,
+    recurrenceDetail: row.recurrence_detail,
+    recurrenceGroupId: row.recurrence_group_id,
     kind: row.kind,
     departmentId: row.department_id,
     attendeeUserIds: row.attendee_user_ids ?? [],
@@ -253,6 +310,11 @@ export async function GET(request: NextRequest) {
       e.starts_at,
       e.ends_at,
       e.color,
+      e.recurrence_type,
+      e.recurrence_days,
+      e.recurrence_end_date::text,
+      e.recurrence_detail,
+      e.recurrence_group_id::text,
       e.kind,
       e.department_id::text,
       e.attendee_user_ids,
@@ -310,9 +372,28 @@ export async function POST(request: NextRequest) {
     endsAt,
     kind,
     color = null,
+    recurrenceType = "none",
+    recurrenceStartDate,
+    recurrenceDays = [],
+    recurrenceEndDate,
+    recurrenceDetail: recurrenceDetailRaw = undefined,
     departmentId = null,
     attendeeUserIds = []
   } = parsed.data;
+  const mergedRecurrenceDetail =
+    recurrenceType !== "none"
+      ? {
+          ...(recurrenceDetailRaw && typeof recurrenceDetailRaw === "object" ? recurrenceDetailRaw : {}),
+          ...(recurrenceStartDate ? { anchorStartDate: recurrenceStartDate } : {})
+        }
+      : null;
+  console.info("[POST /api/events] parsed recurrence payload", {
+    recurrenceType,
+    recurrenceStartDate: recurrenceStartDate ?? null,
+    recurrenceDays,
+    recurrenceEndDate: recurrenceEndDate ?? null,
+    recurrenceDetail: mergedRecurrenceDetail ?? recurrenceDetailRaw
+  });
 
   const departmentForDb = kind === "team" ? departmentId : null;
   if (kind === "announcement" && ctx.role !== "admin") {
@@ -329,6 +410,11 @@ export async function POST(request: NextRequest) {
 
   /** 빈 JS 배열은 node-pg에서 uuid[]로 추론되지 않아 COALESCE(NULL, ARRAY[]::uuid[])로 저장 */
   const attendeeParam: string[] | null = attendeeUserIds.length === 0 ? null : attendeeUserIds;
+  const recurrenceDaysStr =
+    recurrenceType === "weekly" && recurrenceDays.length > 0
+      ? [...new Set(recurrenceDays)].sort((a, b) => a - b).join(",")
+      : null;
+  const recurrenceGroupId = recurrenceType !== "none" ? randomUUID() : null;
 
   let createdByUserId: string;
   try {
@@ -362,42 +448,123 @@ export async function POST(request: NextRequest) {
   });
 
   try {
-    const insert = await db.query<EventRow>(
-      `
-      INSERT INTO events (
-        title, description, starts_at, ends_at, kind, color, department_id, attendee_user_ids, created_by
-      )
-      VALUES (
-        $1,
-        $2,
-        $3::timestamptz,
-        $4::timestamptz,
-        $5,
-        $6,
-        $7::uuid,
-        COALESCE($8::uuid[], ARRAY[]::uuid[]),
-        $9::uuid
-      )
-      RETURNING
-        id,
-        title,
-        description,
-        starts_at,
-        ends_at,
-        color,
-        kind,
-        department_id::text,
-        attendee_user_ids,
-        created_by,
-        created_at,
-        updated_at
-      `,
-      [title, description, startsAt, endsAt, kind, color, departmentForDb, attendeeParam, createdByUserId]
+    const recurrenceBaseStartsAt = recurrenceStartDate
+      ? dayjs(`${recurrenceStartDate}T00:00:00.000Z`)
+          .hour(dayjs(startsAt).hour())
+          .minute(dayjs(startsAt).minute())
+          .second(0)
+          .millisecond(0)
+          .toISOString()
+      : startsAt;
+    const recurrenceBaseEndsAt = recurrenceStartDate
+      ? dayjs(recurrenceBaseStartsAt)
+          .add(new Date(endsAt).getTime() - new Date(startsAt).getTime(), "millisecond")
+          .toISOString()
+      : endsAt;
+    const instanceStarts = expandRecurringStarts(
+      recurrenceBaseStartsAt,
+      recurrenceType,
+      recurrenceEndDate,
+      recurrenceDays,
+      recurrenceType !== "none" ? mergedRecurrenceDetail : recurrenceDetailRaw
     );
+    console.info("[POST /api/events] recurrence expansion", {
+      recurrenceType,
+      recurrenceStartDate: recurrenceStartDate ?? null,
+      recurrenceEndDate: recurrenceEndDate ?? null,
+      recurrenceDays: recurrenceDaysStr,
+      recurrenceDetail: mergedRecurrenceDetail ?? recurrenceDetailRaw,
+      recurrenceGroupId,
+      startsAt: recurrenceBaseStartsAt,
+      endsAt: recurrenceBaseEndsAt,
+      generatedCount: instanceStarts.length,
+      generatedStarts: instanceStarts.map((d) => d.toISOString())
+    });
+    const createdRows: EventRow[] = [];
+    for (let idx = 0; idx < instanceStarts.length; idx++) {
+      const instanceStart = instanceStarts[idx];
+      const instanceEnd = computeInstanceEndsAt(
+        instanceStart,
+        recurrenceType,
+        startsAt,
+        endsAt,
+        recurrenceDays
+      );
+      const insert = await db.query<EventRow>(
+        `
+        INSERT INTO events (
+          title, description, starts_at, ends_at, kind, color, recurrence_type, recurrence_days, recurrence_end_date, recurrence_detail, recurrence_group_id, department_id, attendee_user_ids, created_by
+        )
+        VALUES (
+          $1,
+          $2,
+          $3::timestamptz,
+          $4::timestamptz,
+          $5,
+          $6,
+          $7,
+          $8,
+          $9::date,
+          $10::jsonb,
+          $11::uuid,
+          $12::uuid,
+          COALESCE($13::uuid[], ARRAY[]::uuid[]),
+          $14::uuid
+        )
+        RETURNING
+          id,
+          title,
+          description,
+          starts_at,
+          ends_at,
+          color,
+          recurrence_type,
+          recurrence_days,
+          recurrence_end_date::text,
+          recurrence_detail,
+          recurrence_group_id::text,
+          kind,
+          department_id::text,
+          attendee_user_ids,
+          created_by,
+          created_at,
+          updated_at
+        `,
+        [
+          title,
+          description,
+          instanceStart.toISOString(),
+          instanceEnd.toISOString(),
+          kind,
+          color,
+          recurrenceType,
+          recurrenceDaysStr,
+          recurrenceEndDate ?? null,
+          recurrenceType !== "none" ? mergedRecurrenceDetail : null,
+          recurrenceGroupId,
+          departmentForDb,
+          attendeeParam,
+          createdByUserId
+        ]
+      );
+      console.info("[POST /api/events] recurrence insert result", {
+        index: idx,
+        start: instanceStart.toISOString(),
+        end: instanceEnd.toISOString(),
+        rowCount: insert.rowCount,
+        insertedId: insert.rows[0]?.id ?? null
+      });
+      if (insert.rows[0]) {
+        createdRows.push(insert.rows[0]);
+      }
+    }
+    if (createdRows.length === 0) {
+      throw new Error("recurrence insert produced no rows");
+    }
 
-    const row = insert.rows[0];
+    const row = createdRows[0];
     const attendees = await resolveAttendees(row.attendee_user_ids ?? []);
-    const creatorMap = await resolveCreatorsMap([row]);
+    const creatorMap = await resolveCreatorsMap(createdRows);
     await createActivityLogSafe({
       userId: session.sub,
       actionType: "event_created",
@@ -409,8 +576,13 @@ export async function POST(request: NextRequest) {
     });
 
     console.info("[POST /api/events] success", { eventId: row.id });
+    console.info("[POST /api/events] createdCount", {
+      recurrenceType,
+      createdCount: createdRows.length
+    });
 
     return NextResponse.json({
+      createdCount: createdRows.length,
       event: mapEvent(row, attendees, row.created_by ? creatorMap.get(row.created_by) ?? null : null)
     });
   } catch (e) {

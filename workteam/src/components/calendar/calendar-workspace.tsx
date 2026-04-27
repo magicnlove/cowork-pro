@@ -18,6 +18,7 @@ import isoWeek from "dayjs/plugin/isoWeek";
 import { ReactNode, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { fetchJson } from "@/lib/fetch-json";
 import { markNavBadgeRead } from "@/lib/nav-badge-read";
+import { buildKoreanHolidayMap } from "@/lib/holiday-kr";
 import type { UserOption } from "@/types/tasks";
 import {
   KIND_LABEL,
@@ -37,6 +38,14 @@ const EVENT_COLOR_PRESETS = [
   { label: "파랑", value: "#d8eeff" },
   { label: "보라", value: "#f3def9" }
 ] as const;
+const RECURRENCE_LABEL: Record<"none" | "daily" | "weekly" | "weekday" | "monthly" | "yearly", string> = {
+  none: "없음",
+  daily: "매일",
+  weekly: "매주",
+  weekday: "매주 월-금",
+  monthly: "매월",
+  yearly: "매년"
+};
 
 function kindStyle(kind: CalendarKind) {
   switch (kind) {
@@ -82,11 +91,15 @@ function eventCalendarLastDay(ev: CalendarEvent): dayjs.Dayjs {
 const SPAN_BAR_H = 18;
 const SPAN_BAR_GAP = 2;
 
-type WeekSpanSegment = { ev: CalendarEvent; col0: number; col1: number; lane: number };
+type WeekSpanSegment = { ev: CalendarEvent; col0: number; col1: number; lane: number; hiddenEventIds?: string[] };
 
 /** 한 주(7칸) 안에서 다중일 일정 가로 바 레이어: 겹치면 lane 증가 */
-function layoutWeekSpanSegments(weekDays: dayjs.Dayjs[], allEvents: CalendarEvent[]): { segments: WeekSpanSegment[]; laneCount: number } {
+function layoutWeekSpanSegments(
+  weekDays: dayjs.Dayjs[],
+  allEvents: CalendarEvent[]
+): { segments: WeekSpanSegment[]; laneCount: number; hiddenEventIds: Set<string> } {
   const raw: { ev: CalendarEvent; col0: number; col1: number }[] = [];
+  const hiddenEventIds = new Set<string>();
   for (const ev of allEvents) {
     if (!isMultiDayCalendarEvent(ev)) continue;
     let col0 = -1;
@@ -106,6 +119,38 @@ function layoutWeekSpanSegments(weekDays: dayjs.Dayjs[], allEvents: CalendarEven
     }
     raw.push({ ev, col0, col1 });
   }
+  // 시각적 트릭: weekly/weekday/daily 반복의 같은 그룹 인스턴스를 주 단위로 연속 막대로 묶어 표시
+  const visualGroupByRecurrence = new Map<
+    string,
+    { col: number; ev: CalendarEvent }[]
+  >();
+  for (const ev of allEvents) {
+    if (isMultiDayCalendarEvent(ev)) continue;
+    if (!ev.recurrenceGroupId) continue;
+    if (!["daily", "weekly", "weekday"].includes(ev.recurrenceType ?? "none")) continue;
+    const col = weekDays.findIndex((d) => d.isSame(dayjs(ev.startsAt), "day"));
+    if (col < 0) continue;
+    const k = `${ev.recurrenceGroupId}|${ev.title}|${ev.kind}|${ev.color ?? ""}`;
+    const arr = visualGroupByRecurrence.get(k) ?? [];
+    arr.push({ col, ev });
+    visualGroupByRecurrence.set(k, arr);
+  }
+  for (const arr of visualGroupByRecurrence.values()) {
+    const uniq = [...new Map(arr.map((x) => [x.col, x])).values()].sort((a, b) => a.col - b.col);
+    let i = 0;
+    while (i < uniq.length) {
+      let j = i;
+      while (j + 1 < uniq.length && uniq[j + 1].col === uniq[j].col + 1) j++;
+      if (j > i) {
+        const startCol = uniq[i].col;
+        const endCol = uniq[j].col;
+        const base = uniq[i].ev;
+        raw.push({ ev: base, col0: startCol, col1: endCol });
+        for (let p = i; p <= j; p++) hiddenEventIds.add(uniq[p].ev.id);
+      }
+      i = j + 1;
+    }
+  }
   raw.sort((a, b) => a.col0 - b.col0 || a.col1 - b.col1 || a.ev.id.localeCompare(b.ev.id));
   const laneEnds: number[] = [];
   const segments: WeekSpanSegment[] = [];
@@ -124,7 +169,7 @@ function layoutWeekSpanSegments(weekDays: dayjs.Dayjs[], allEvents: CalendarEven
     }
     segments.push({ ...s, lane });
   }
-  return { segments, laneCount: laneEnds.length };
+  return { segments, laneCount: laneEnds.length, hiddenEventIds };
 }
 
 /** 월 그리드: 포인터 아래의 `data-month-day`(YYYY-MM-DD) 셀 키 */
@@ -133,6 +178,16 @@ function monthDayKeyFromPoint(clientX: number, clientY: number): string | null {
   if (!el || !(el instanceof Element)) return null;
   const hit = el.closest("[data-month-day]");
   return hit?.getAttribute("data-month-day") ?? null;
+}
+
+function dayKeyFromPoint(clientX: number, clientY: number): string | null {
+  const el = document.elementFromPoint(clientX, clientY);
+  if (!el || !(el instanceof Element)) return null;
+  const cell = el.closest("[data-day-key]");
+  const cellKey = cell?.getAttribute("data-day-key");
+  if (cellKey) return cellKey;
+  const monthKey = el.closest("[data-month-day]")?.getAttribute("data-month-day");
+  return monthKey ?? null;
 }
 
 function moveEventToNewDay(ev: CalendarEvent, targetDay: dayjs.Dayjs): { startsAt: string; endsAt: string } {
@@ -200,16 +255,28 @@ function layoutTimedEventsStack(events: CalendarEvent[], day: dayjs.Dayjs): Map<
 function DraggableEventChip({
   event: ev,
   compact,
+  enableResize = false,
+  resizeMode = "time",
+  previewing = false,
+  onResizeStart,
   onClick
 }: {
   event: CalendarEvent;
   /** 월간 그리드: 한 줄·truncate. 일/주 시간축: 줄바꿈·겹침 열 대응 */
   compact?: boolean;
+  enableResize?: boolean;
+  resizeMode?: "time" | "day";
+  previewing?: boolean;
+  onResizeStart?: (
+    ev: CalendarEvent,
+    mode: "time" | "day",
+    e: ReactPointerEvent<HTMLSpanElement>
+  ) => void;
   onClick: (e: CalendarEvent) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `evt-${ev.id}`,
-    data: { event: ev }
+    data: { event: ev, mode: "move" as const }
   });
 
   const style = transform
@@ -229,15 +296,16 @@ function DraggableEventChip({
         onClick(ev);
       }}
       className={clsx(
-        "pointer-events-auto w-full min-w-0 rounded border border-black/[0.06] px-1.5 py-0.5 text-left text-xs font-medium shadow-sm transition hover:brightness-[0.98]",
+        "pointer-events-auto relative w-full min-w-0 rounded border border-black/[0.06] px-1.5 py-0.5 text-left text-xs font-medium shadow-sm transition hover:brightness-[0.98]",
         surface.className,
         compact ? "truncate leading-tight" : "flex min-h-[28px] flex-col gap-0.5 py-1 whitespace-normal break-words [overflow-wrap:anywhere]",
-        isDragging && "opacity-40"
+        (isDragging || previewing) && "opacity-40"
       )}
     >
       {compact ? (
         <>
           {dayjs(ev.startsAt).format("HH:mm")} {ev.title}
+          {ev.recurrenceGroupId ? " (반복)" : ""}
         </>
       ) : (
         <>
@@ -245,9 +313,30 @@ function DraggableEventChip({
           <span className="shrink-0 text-[10px] tabular-nums leading-none opacity-80">
             {dayjs(ev.startsAt).format("HH:mm")} – {dayjs(ev.endsAt).format("HH:mm")}
           </span>
-          <span className="min-w-0 text-xs font-semibold leading-snug">{ev.title}</span>
+          <span className="min-w-0 text-xs font-semibold leading-snug">
+            {ev.title}
+            {ev.recurrenceGroupId ? " (반복)" : ""}
+          </span>
         </>
       )}
+      {enableResize ? (
+        <span
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onResizeStart?.(ev, resizeMode, e);
+          }}
+          className={clsx(
+            "pointer-events-auto absolute touch-none cursor-ns-resize rounded border border-black/10 bg-white/80 px-1 text-[9px] leading-none text-slate-600",
+            compact ? "bottom-0 right-0" : "bottom-0.5 right-0.5",
+            "opacity-80 hover:opacity-100"
+          )}
+          aria-label="종료 시각 조정"
+          title="종료 시각 조정"
+        >
+          ⋮
+        </span>
+      ) : null}
     </button>
   );
 }
@@ -256,6 +345,9 @@ function DraggableEventChip({
 function DraggableSpanBar({
   dragId,
   event: ev,
+  enableResize = false,
+  previewing = false,
+  onResizeStart,
   onClick,
   roundedLeft,
   roundedRight
@@ -263,13 +355,16 @@ function DraggableSpanBar({
   /** 주·월에서 동일 일정이 여러 행에 있을 수 있어 고유 id 필요 (`span|…`) */
   dragId: string;
   event: CalendarEvent;
+  enableResize?: boolean;
+  previewing?: boolean;
+  onResizeStart?: (ev: CalendarEvent, mode: "day", e: ReactPointerEvent<HTMLSpanElement>) => void;
   onClick: (e: CalendarEvent) => void;
   roundedLeft: boolean;
   roundedRight: boolean;
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: dragId,
-    data: { event: ev }
+    data: { event: ev, mode: "move" as const }
   });
   const surface = eventSurfaceStyle(ev);
   const tStyle = transform
@@ -287,14 +382,32 @@ function DraggableSpanBar({
         onClick(ev);
       }}
       className={clsx(
-        "box-border h-full min-h-0 w-full truncate border border-black/[0.06] px-1.5 text-left text-[10px] font-semibold leading-[16px] shadow-sm transition hover:brightness-[0.98]",
+        "pointer-events-auto relative box-border h-full min-h-0 w-full truncate border border-black/[0.06] px-1.5 text-left text-[10px] font-semibold leading-[16px] shadow-sm transition hover:brightness-[0.98]",
         surface.className,
         roundedLeft && "rounded-l-md",
         roundedRight && "rounded-r-md",
-        isDragging && "opacity-40"
+        (isDragging || previewing) && "opacity-40"
       )}
     >
       {ev.title}
+      {ev.recurrenceGroupId ? " (반복)" : ""}
+      {enableResize ? (
+        <span
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onResizeStart?.(ev, "day", e);
+          }}
+          className={clsx(
+            "pointer-events-auto absolute inset-y-0 right-0 flex w-2 touch-none cursor-ew-resize items-center justify-center rounded-r-md border-l border-black/10 bg-white/60 text-[9px] text-slate-600",
+            "opacity-80 hover:opacity-100"
+          )}
+          aria-label="종료 일자 조정"
+          title="종료 일자 조정"
+        >
+          ⋮
+        </span>
+      ) : null}
     </button>
   );
 }
@@ -303,12 +416,14 @@ function DroppableDayCell({
   dayKey,
   isToday,
   muted,
+  weekend,
   rangeHighlight,
   children
 }: {
   dayKey: string;
   isToday: boolean;
   muted: boolean;
+  weekend?: boolean;
   /** 월 뷰: 날짜 범위 드래그 중 선택 구간 하이라이트 */
   rangeHighlight?: boolean;
   children: ReactNode;
@@ -317,9 +432,12 @@ function DroppableDayCell({
   return (
     <div
       ref={setNodeRef}
+      data-day-key={dayKey}
       className={clsx(
         "min-h-[92px] border-b border-r border-slate-200/90 bg-white p-1",
-        muted && "bg-slate-50/80",
+        muted && "bg-slate-100/80",
+        weekend && !muted && "bg-slate-200/50",
+        weekend && muted && "bg-slate-200/70",
         isToday && "bg-blue-50/60 ring-1 ring-inset ring-blue-300/80",
         isOver && "bg-brand-50/70 ring-2 ring-brand-300",
         rangeHighlight && "relative z-[2] bg-brand-100/80 ring-2 ring-inset ring-brand-400/70"
@@ -340,6 +458,10 @@ function snapToQuarterMinutes(rawMin: number): number {
     s = MINUTES_IN_DAY - SNAP_MINUTES;
   }
   return s;
+}
+
+function snapSignedQuarterMinutes(rawMin: number): number {
+  return Math.round(rawMin / SNAP_MINUTES) * SNAP_MINUTES;
 }
 
 /** 드래그 끝 시각을 당일 내로 맞추고, 최소 15분 구간 보장 */
@@ -708,6 +830,16 @@ export function CalendarWorkspace() {
   const [view, setView] = useState<CalendarViewMode>("month");
   const [departmentFilter, setDepartmentFilter] = useState<string>("all");
   const [activeEv, setActiveEv] = useState<CalendarEvent | null>(null);
+  const [resizeDraft, setResizeDraft] = useState<{
+    eventId: string;
+    startsAt: string;
+    endsAt: string;
+  } | null>(null);
+  const resizeDraftRef = useRef<{
+    eventId: string;
+    startsAt: string;
+    endsAt: string;
+  } | null>(null);
   const [detail, setDetail] = useState<CalendarEvent | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [createDate, setCreateDate] = useState<string | null>(null);
@@ -724,6 +856,21 @@ export function CalendarWorkspace() {
     sy: number;
   } | null>(null);
   const monthRangeWinCleanupRef = useRef<(() => void) | null>(null);
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
+  const resizeSessionRef = useRef<{
+    event: CalendarEvent;
+    mode: "time" | "day";
+    startX: number;
+    startY: number;
+    initialEnd: dayjs.Dayjs;
+    initialEndDay: dayjs.Dayjs;
+    initialStart: dayjs.Dayjs;
+    pixelsPerHour: number;
+  } | null>(null);
+
+  useEffect(() => {
+    resizeDraftRef.current = resizeDraft;
+  }, [resizeDraft]);
 
   useEffect(() => {
     if (detail) {
@@ -792,14 +939,25 @@ export function CalendarWorkspace() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: async (p: { id: string; body: Record<string, unknown> }) =>
-      fetchJson<{ event: CalendarEvent }>(`/api/events/${p.id}`, {
+    mutationFn: async (p: { id: string; body: Record<string, unknown> }) => {
+      const isRecurringEdit = (detail?.recurrenceType ?? "none") !== "none";
+      if (isRecurringEdit) {
+        const { updateScope: _ignored, ...createBody } = p.body;
+        await fetchJson(`/api/events/${p.id}`, { method: "DELETE" });
+        return fetchJson<{ event: CalendarEvent }>("/api/events", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(createBody)
+        });
+      }
+      return fetchJson<{ event: CalendarEvent }>(`/api/events/${p.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(p.body)
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["events"] });
+      });
+    },
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["events"] });
       setDetail(null);
     }
   });
@@ -812,6 +970,7 @@ export function CalendarWorkspace() {
         body: JSON.stringify(body)
       }),
     onSuccess: () => {
+      console.info("[CalendarWorkspace] create success -> invalidate ['events']");
       qc.invalidateQueries({ queryKey: ["events"] });
       setCreateOpen(false);
       setCreateTimeRange(null);
@@ -827,7 +986,7 @@ export function CalendarWorkspace() {
     }
   });
 
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 2 } }));
 
   const [hideAnnouncements, setHideAnnouncements] = useState(false);
   useEffect(() => {
@@ -852,6 +1011,16 @@ export function CalendarWorkspace() {
     }
     return raw.filter((e) => e.kind !== "announcement");
   }, [eventsQuery.data, hideAnnouncements]);
+
+  const renderEvents = useMemo(() => {
+    if (!resizeDraft) return displayEvents;
+    return displayEvents.map((ev) =>
+      ev.id === resizeDraft.eventId
+        ? { ...ev, startsAt: resizeDraft.startsAt, endsAt: resizeDraft.endsAt }
+        : ev
+    );
+  }, [displayEvents, resizeDraft]);
+  const resizingEventId = resizeDraft?.eventId ?? null;
 
   const departmentFilterOptions = useMemo(() => {
     if (!canUseDepartmentFilter) return [];
@@ -887,6 +1056,19 @@ export function CalendarWorkspace() {
     const start = cursor.startOf("isoWeek");
     return Array.from({ length: 7 }, (_, i) => start.add(i, "day"));
   }, [cursor]);
+  const holidayMap = useMemo(() => buildKoreanHolidayMap(2024, 2040), []);
+  const getHolidayName = useCallback(
+    (d: dayjs.Dayjs) => holidayMap.get(d.format("YYYY-MM-DD")) ?? null,
+    [holidayMap]
+  );
+  const isWeekend = useCallback((d: dayjs.Dayjs) => {
+    const wd = d.day();
+    return wd === 0 || wd === 6;
+  }, []);
+  const weekSpanLayout = useMemo(
+    () => layoutWeekSpanSegments(weekDays, renderEvents),
+    [weekDays, renderEvents]
+  );
 
   const openCreateFromMonthRange = useCallback((lo: string, hi: string) => {
     setCreateDate(lo);
@@ -941,6 +1123,8 @@ export function CalendarWorkspace() {
   useEffect(() => {
     return () => {
       clearMonthRangeWindowListeners();
+      resizeCleanupRef.current?.();
+      resizeCleanupRef.current = null;
     };
   }, [clearMonthRangeWindowListeners]);
 
@@ -950,6 +1134,85 @@ export function CalendarWorkspace() {
       setMonthRangeDrag(null);
     }
   }, [view, createOpen, clearMonthRangeWindowListeners]);
+
+  const beginResizeFromHandle = useCallback(
+    (ev: CalendarEvent, mode: "time" | "day", e: ReactPointerEvent<HTMLSpanElement>) => {
+      if (createOpen) return;
+      resizeCleanupRef.current?.();
+      resizeCleanupRef.current = null;
+      const initialStart = dayjs(ev.startsAt);
+      const initialEnd = dayjs(ev.endsAt);
+      resizeSessionRef.current = {
+        event: ev,
+        mode,
+        startX: e.clientX,
+        startY: e.clientY,
+        initialEnd,
+        initialEndDay: initialEnd.startOf("day"),
+        initialStart,
+        pixelsPerHour: view === "day" ? 56 : 48
+      };
+      setResizeDraft({ eventId: ev.id, startsAt: ev.startsAt, endsAt: ev.endsAt });
+
+      const move = (pe: PointerEvent) => {
+        const sess = resizeSessionRef.current;
+        if (!sess) return;
+        const targetDayKey = dayKeyFromPoint(pe.clientX, pe.clientY);
+        const targetDay = targetDayKey ? dayjs(targetDayKey) : sess.initialEndDay;
+        const dayDiff = targetDay.startOf("day").diff(sess.initialEndDay, "day");
+        const deltaMinRaw =
+          sess.mode === "time"
+            ? ((pe.clientY - sess.startY) / sess.pixelsPerHour) * 60
+            : 0;
+        const deltaMin = sess.mode === "time" ? snapSignedQuarterMinutes(deltaMinRaw) : 0;
+        let nextEnd = sess.initialEnd
+          .add(dayDiff, "day")
+          .add(deltaMin, "minute")
+          .second(0)
+          .millisecond(0);
+        const minEnd = sess.initialStart.add(SNAP_MINUTES, "minute");
+        if (!nextEnd.isAfter(minEnd)) {
+          nextEnd = minEnd;
+        }
+        setResizeDraft({
+          eventId: sess.event.id,
+          startsAt: sess.initialStart.toISOString(),
+          endsAt: nextEnd.toISOString()
+        });
+      };
+
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+        resizeCleanupRef.current = null;
+        const sess = resizeSessionRef.current;
+        resizeSessionRef.current = null;
+        if (!sess) {
+          setResizeDraft(null);
+          return;
+        }
+        const draft = resizeDraftRef.current;
+        setResizeDraft(null);
+        if (!draft || draft.eventId !== sess.event.id) return;
+        if (draft.startsAt === sess.event.startsAt && draft.endsAt === sess.event.endsAt) return;
+        moveMutation.mutate({
+          id: sess.event.id,
+          body: { startsAt: draft.startsAt, endsAt: draft.endsAt }
+        });
+      };
+
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+      resizeCleanupRef.current = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+      };
+    },
+    [createOpen, view, moveMutation]
+  );
 
   const onMonthGridCellPointerDown = useCallback(
     (anchorKey: string, e: ReactPointerEvent<HTMLDivElement>) => {
@@ -980,8 +1243,9 @@ export function CalendarWorkspace() {
         monthRangeSessionRef.current = null;
         setMonthRangeDrag(null);
         if (!sess) return;
-        const lo = sess.anchor <= sess.hover ? sess.anchor : sess.hover;
-        const hi = sess.anchor <= sess.hover ? sess.hover : sess.anchor;
+        const finalKey = monthDayKeyFromPoint(ev.clientX, ev.clientY) ?? sess.hover;
+        const lo = sess.anchor <= finalKey ? sess.anchor : finalKey;
+        const hi = sess.anchor <= finalKey ? finalKey : sess.anchor;
         const dist = Math.hypot(ev.clientX - sess.sx, ev.clientY - sess.sy);
         const crossCell = lo !== hi;
         if (crossCell || dist >= 12) {
@@ -1002,7 +1266,9 @@ export function CalendarWorkspace() {
   );
 
   function handleDragStart(e: DragStartEvent) {
-    const data = e.active.data.current as { event?: CalendarEvent } | undefined;
+    const data = e.active.data.current as
+      | { event?: CalendarEvent; mode?: "move" | "resize" | "resizeDay" }
+      | undefined;
     if (data?.event) setActiveEv(data.event);
   }
 
@@ -1015,12 +1281,101 @@ export function CalendarWorkspace() {
     const dayKey = oid.slice(4);
     const targetDay = dayjs(dayKey);
     const raw = String(active.id);
-    const eventId = raw.startsWith("span|") ? (raw.split("|")[1] ?? "") : raw.replace("evt-", "");
-    const ev = displayEvents.find((x) => x.id === eventId);
+    const eventId = raw.startsWith("span|")
+      ? (raw.split("|")[1] ?? "")
+      : raw.startsWith("evt-")
+        ? raw.slice(4)
+        : raw.startsWith("rz-")
+          ? raw.slice(3)
+          : raw.startsWith("srz-span|")
+            ? (raw.split("|")[1] ?? "")
+            : raw;
+    const data = active.data.current as
+      | { event?: CalendarEvent; mode?: "move" | "resize" | "resizeDay" }
+      | undefined;
+    const ev = data?.event ?? renderEvents.find((x) => x.id === eventId);
     if (!ev) return;
-    if (dayjs(ev.startsAt).isSame(targetDay, "day")) return;
-    const next = moveEventToNewDay(ev, targetDay);
-    moveMutation.mutate({ id: ev.id, body: { startsAt: next.startsAt, endsAt: next.endsAt } });
+    const mode = data?.mode ?? "move";
+
+    if (view === "month") {
+      if (mode === "resize" || mode === "resizeDay") {
+        const start = dayjs(ev.startsAt);
+        let nextEnd = dayjs(ev.endsAt)
+          .year(targetDay.year())
+          .month(targetDay.month())
+          .date(targetDay.date())
+          .second(0)
+          .millisecond(0);
+        const minEnd = start.add(SNAP_MINUTES, "minute");
+        if (!nextEnd.isAfter(minEnd)) {
+          nextEnd = minEnd;
+        }
+        moveMutation.mutate({
+          id: ev.id,
+          body: { startsAt: start.toISOString(), endsAt: nextEnd.toISOString() }
+        });
+        return;
+      }
+      if (dayjs(ev.startsAt).isSame(targetDay, "day")) return;
+      const next = moveEventToNewDay(ev, targetDay);
+      moveMutation.mutate({ id: ev.id, body: { startsAt: next.startsAt, endsAt: next.endsAt } });
+      return;
+    }
+
+    const pixelsPerHour = view === "day" ? 56 : 48;
+    const deltaMin = snapSignedQuarterMinutes((e.delta.y / pixelsPerHour) * 60);
+    const start = dayjs(ev.startsAt);
+    const end = dayjs(ev.endsAt);
+
+    if (mode === "resizeDay") {
+      const start = dayjs(ev.startsAt);
+      let nextEnd = dayjs(ev.endsAt)
+        .year(targetDay.year())
+        .month(targetDay.month())
+        .date(targetDay.date())
+        .second(0)
+        .millisecond(0);
+      const minEnd = start.add(SNAP_MINUTES, "minute");
+      if (!nextEnd.isAfter(minEnd)) {
+        nextEnd = minEnd;
+      }
+      moveMutation.mutate({
+        id: ev.id,
+        body: { startsAt: start.toISOString(), endsAt: nextEnd.toISOString() }
+      });
+      return;
+    }
+
+    if (mode === "resize") {
+      const endDayDiff = targetDay.startOf("day").diff(end.startOf("day"), "day");
+      let nextEnd = end
+        .add(endDayDiff, "day")
+        .add(deltaMin, "minute")
+        .second(0)
+        .millisecond(0);
+      const minEnd = start.add(SNAP_MINUTES, "minute");
+      if (!nextEnd.isAfter(minEnd)) {
+        nextEnd = minEnd;
+      }
+      moveMutation.mutate({
+        id: ev.id,
+        body: { startsAt: start.toISOString(), endsAt: nextEnd.toISOString() }
+      });
+      return;
+    }
+
+    const startDayDiff = targetDay.startOf("day").diff(start.startOf("day"), "day");
+    const duration = end.diff(start, "millisecond");
+    const nextStart = start
+      .add(startDayDiff, "day")
+      .add(deltaMin, "minute")
+      .second(0)
+      .millisecond(0);
+    const nextEnd = nextStart.add(duration, "millisecond");
+    moveMutation.mutate({
+      id: ev.id,
+      body: { startsAt: nextStart.toISOString(), endsAt: nextEnd.toISOString() }
+    });
   }
 
   function titleText(): string {
@@ -1138,14 +1493,20 @@ export function CalendarWorkspace() {
           {!eventsQuery.isLoading && view === "month" && (
             <div className="min-w-[720px]">
               <div className="grid grid-cols-7 border-b border-slate-200 bg-slate-50/90">
-                {WEEKDAYS.map((w) => (
-                  <div key={w} className="border-r border-slate-200 px-2 py-2 text-center text-xs font-semibold text-slate-500 last:border-r-0">
+                {WEEKDAYS.map((w, idx) => (
+                  <div
+                    key={w}
+                    className={clsx(
+                      "border-r border-slate-200 px-2 py-2 text-center text-xs font-semibold last:border-r-0",
+                      idx < 5 ? "bg-slate-200/80 text-slate-600" : "text-slate-500"
+                    )}
+                  >
                     {w}
                   </div>
                 ))}
               </div>
               {monthWeeks.map((week, weekIdx) => {
-                const { segments, laneCount } = layoutWeekSpanSegments(week, displayEvents);
+                const { segments, laneCount, hiddenEventIds } = layoutWeekSpanSegments(week, renderEvents);
                 const stripPad = 4;
                 const stripMinH = laneCount > 0 ? laneCount * (SPAN_BAR_H + SPAN_BAR_GAP) + stripPad : 0;
                 return (
@@ -1171,6 +1532,9 @@ export function CalendarWorkspace() {
                               <DraggableSpanBar
                                 dragId={`span|${s.ev.id}|m${weekIdx}-${week[0].format("YYYY-MM-DD")}`}
                                 event={s.ev}
+                                enableResize
+                                previewing={resizingEventId === s.ev.id}
+                                onResizeStart={beginResizeFromHandle}
                                 onClick={setDetail}
                                 roundedLeft={isSegStart}
                                 roundedRight={isSegEnd}
@@ -1184,8 +1548,12 @@ export function CalendarWorkspace() {
                       const key = day.format("YYYY-MM-DD");
                       const inMonth = day.month() === cursor.month();
                       const today = day.isSame(dayjs(), "day");
-                      const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, day));
-                      const chipEvents = dayEvents.filter((ev) => !isMultiDayCalendarEvent(ev));
+                      const holidayName = getHolidayName(day);
+                      const weekend = isWeekend(day);
+                      const dayEvents = renderEvents.filter((ev) => eventTouchesDay(ev, day));
+                      const chipEvents = dayEvents.filter(
+                        (ev) => !isMultiDayCalendarEvent(ev) && !hiddenEventIds.has(ev.id)
+                      );
                       const dragLo =
                         monthRangeDrag &&
                         (monthRangeDrag.anchor <= monthRangeDrag.hover
@@ -1205,6 +1573,7 @@ export function CalendarWorkspace() {
                           dayKey={key}
                           isToday={today}
                           muted={!inMonth}
+                          weekend={weekend}
                           rangeHighlight={rangeHighlight}
                         >
                           <div className="relative flex min-h-[84px] flex-col">
@@ -1224,7 +1593,13 @@ export function CalendarWorkspace() {
                                     "text-sm font-medium",
                                     today
                                       ? "flex h-7 w-7 items-center justify-center rounded-full bg-blue-600 text-white"
-                                      : "text-slate-800"
+                                      : holidayName
+                                        ? "text-red-500"
+                                        : weekend
+                                          ? "text-slate-400"
+                                          : !inMonth
+                                            ? "text-slate-400"
+                                            : "text-slate-800"
                                   )}
                                 >
                                   {day.date()}
@@ -1245,9 +1620,21 @@ export function CalendarWorkspace() {
                                   </button>
                                 )}
                               </div>
+                              {holidayName ? (
+                                <div className="mb-1 truncate text-[10px] font-semibold text-red-500">{holidayName}</div>
+                              ) : null}
                               <div className="flex max-h-[72px] flex-col gap-0.5 overflow-hidden">
                                 {chipEvents.slice(0, 3).map((ev) => (
-                                  <DraggableEventChip key={ev.id} event={ev} compact onClick={setDetail} />
+                                  <DraggableEventChip
+                                    key={ev.id}
+                                    event={ev}
+                                    compact
+                                    enableResize
+                                    resizeMode="day"
+                                    previewing={resizingEventId === ev.id}
+                                    onResizeStart={beginResizeFromHandle}
+                                    onClick={setDetail}
+                                  />
                                 ))}
                                 {chipEvents.length > 3 && (
                                   <span className="truncate pl-1 text-[10px] text-slate-500">
@@ -1273,12 +1660,15 @@ export function CalendarWorkspace() {
                 {weekDays.map((d) => {
                   const key = d.format("YYYY-MM-DD");
                   const today = d.isSame(dayjs(), "day");
+                  const holidayName = getHolidayName(d);
+                  const weekend = isWeekend(d);
                   return (
                     <div
                       key={key}
                       className={clsx(
                         "border-r border-slate-200 px-1 py-2 text-center text-xs font-semibold last:border-r-0",
-                        today ? "text-blue-700" : "text-slate-600"
+                        !weekend && "bg-slate-200/80",
+                        today ? "text-blue-700" : holidayName ? "text-red-500" : weekend ? "text-slate-500" : "text-slate-600"
                       )}
                     >
                       <div>{d.format("ddd")}</div>
@@ -1290,12 +1680,13 @@ export function CalendarWorkspace() {
                       >
                         {d.date()}
                       </div>
+                      {holidayName ? <div className="mt-0.5 truncate text-[10px] text-red-500">{holidayName}</div> : null}
                     </div>
                   );
                 })}
               </div>
               {(() => {
-                const { segments, laneCount } = layoutWeekSpanSegments(weekDays, displayEvents);
+                const { segments, laneCount } = weekSpanLayout;
                 const stripPad = 4;
                 const stripMinH = laneCount > 0 ? laneCount * (SPAN_BAR_H + SPAN_BAR_GAP) + stripPad : 0;
                 return (
@@ -1322,6 +1713,9 @@ export function CalendarWorkspace() {
                               <DraggableSpanBar
                                 dragId={`span|${s.ev.id}|${weekDays[0].format("YYYY-MM-DD")}`}
                                 event={s.ev}
+                                enableResize
+                                previewing={resizingEventId === s.ev.id}
+                                onResizeStart={beginResizeFromHandle}
                                 onClick={setDetail}
                                 roundedLeft={isSegStart}
                                 roundedRight={isSegEnd}
@@ -1347,11 +1741,13 @@ export function CalendarWorkspace() {
                 {weekDays.map((d) => {
                   const key = d.format("YYYY-MM-DD");
                   const today = d.isSame(dayjs(), "day");
-                  const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, d));
-                  const timedDayEvents = dayEvents.filter((ev) => !isMultiDayCalendarEvent(ev));
+                  const dayEvents = renderEvents.filter((ev) => eventTouchesDay(ev, d));
+                  const timedDayEvents = dayEvents.filter(
+                    (ev) => !isMultiDayCalendarEvent(ev) && !weekSpanLayout.hiddenEventIds.has(ev.id)
+                  );
                   const stackMap = layoutTimedEventsStack(timedDayEvents, d);
                   return (
-                    <DroppableDayCell key={key} dayKey={key} isToday={today} muted={false}>
+                    <DroppableDayCell key={key} dayKey={key} isToday={today} muted={false} weekend={isWeekend(d)}>
                       <div className="relative min-h-[1152px] min-w-[120px]">
                         <div className="relative z-0">
                           {Array.from({ length: 24 }, (_, h) => (
@@ -1384,7 +1780,14 @@ export function CalendarWorkspace() {
                                   right: "auto"
                                 }}
                               >
-                                <DraggableEventChip event={ev} onClick={setDetail} />
+                                <DraggableEventChip
+                                  event={ev}
+                                  onClick={setDetail}
+                                  enableResize
+                                  resizeMode="time"
+                                  previewing={resizingEventId === ev.id}
+                                  onResizeStart={beginResizeFromHandle}
+                                />
                               </div>
                             );
                           })}
@@ -1407,14 +1810,29 @@ export function CalendarWorkspace() {
 
           {!eventsQuery.isLoading && view === "day" && (
             <div className="min-w-[min(100%,480px)]">
+              {(() => {
+                const holidayName = getHolidayName(cursor);
+                const weekend = isWeekend(cursor);
+                return (
               <div
                 className={clsx(
                   "border-b border-slate-200 px-4 py-3 text-center",
+                  weekend && "bg-slate-200/70",
                   cursor.isSame(dayjs(), "day") && "bg-blue-50/80"
                 )}
               >
-                <span className="text-sm font-semibold text-slate-800">{cursor.format("YYYY년 M월 D일 dddd")}</span>
+                <span
+                  className={clsx(
+                    "text-sm font-semibold",
+                    holidayName ? "text-red-500" : weekend ? "text-slate-500" : "text-slate-800"
+                  )}
+                >
+                  {cursor.format("YYYY년 M월 D일 dddd")}
+                </span>
+                {holidayName ? <span className="ml-2 text-xs font-semibold text-red-500">{holidayName}</span> : null}
               </div>
+                );
+              })()}
               <div className="flex min-w-0">
                 <div className="w-12 shrink-0 border-r border-slate-200 bg-slate-50/50 py-1 text-right text-[10px] text-slate-400">
                   {Array.from({ length: 24 }, (_, h) => (
@@ -1428,6 +1846,7 @@ export function CalendarWorkspace() {
                   dayKey={cursor.format("YYYY-MM-DD")}
                   isToday={cursor.isSame(dayjs(), "day")}
                   muted={false}
+                  weekend={isWeekend(cursor)}
                 >
                   <div className="relative min-h-[1344px] w-full min-w-[280px]">
                     <div className="relative z-0">
@@ -1444,7 +1863,7 @@ export function CalendarWorkspace() {
                     />
                     <div className="pointer-events-none absolute inset-0 z-[2]">
                       {(() => {
-                        const dayEvents = displayEvents.filter((ev) => eventTouchesDay(ev, cursor));
+                        const dayEvents = renderEvents.filter((ev) => eventTouchesDay(ev, cursor));
                         const stackMap = layoutTimedEventsStack(dayEvents, cursor);
                         return dayEvents.map((ev) => {
                           const start = dayjs(ev.startsAt);
@@ -1471,7 +1890,14 @@ export function CalendarWorkspace() {
                                 right: "auto"
                               }}
                             >
-                              <DraggableEventChip event={ev} onClick={setDetail} />
+                              <DraggableEventChip
+                                event={ev}
+                                onClick={setDetail}
+                                enableResize
+                                resizeMode="time"
+                                previewing={resizingEventId === ev.id}
+                                onResizeStart={beginResizeFromHandle}
+                              />
                             </div>
                           );
                         });
@@ -1488,6 +1914,7 @@ export function CalendarWorkspace() {
           {activeEv ? (
             <div className={clsx("max-w-[200px] rounded border px-2 py-1 text-xs shadow-lg", kindStyle(activeEv.kind))}>
               {activeEv.title}
+              {activeEv.recurrenceGroupId ? " (반복)" : ""}
             </div>
           ) : null}
         </DragOverlay>
@@ -1590,6 +2017,75 @@ function EventFormModal({
     event ? dayjs(event.endsAt).format("HH:mm") : initialTimeRange?.end ?? "10:00"
   );
   const [color, setColor] = useState<string | null>(() => event?.color ?? null);
+  const [showRecurrencePanel, setShowRecurrencePanel] = useState<boolean>(
+    () => (event?.recurrenceType ?? "none") !== "none"
+  );
+  const [recurrenceType, setRecurrenceType] = useState<"none" | "daily" | "weekly" | "weekday" | "monthly" | "yearly">(
+    () => (event?.recurrenceType as "none" | "daily" | "weekly" | "weekday" | "monthly" | "yearly") ?? "none"
+  );
+  const [recurrenceDays, setRecurrenceDays] = useState<number[]>(
+    () =>
+      (event?.recurrenceDays ?? "")
+        .split(",")
+        .map((v) => Number(v.trim()))
+        .filter((v) => Number.isFinite(v) && v >= 1 && v <= 7)
+  );
+  const [recurrenceEndDate, setRecurrenceEndDate] = useState<string>(
+    () => event?.recurrenceEndDate ?? endDayInit
+  );
+  const eventRecurrenceDetail = (event?.recurrenceDetail ?? null) as Record<string, unknown> | null;
+  const anchorFromStoredDetail = (() => {
+    const a = eventRecurrenceDetail?.anchorStartDate;
+    return typeof a === "string" && /^\d{4}-\d{2}-\d{2}$/.test(a) ? a : undefined;
+  })();
+  const [recurrenceStartDate, setRecurrenceStartDate] = useState<string>(
+    () => anchorFromStoredDetail ?? startDayInit
+  );
+  const [monthlyMode, setMonthlyMode] = useState<"dayOfMonth" | "nthWeekday" | "range">(
+    () =>
+      eventRecurrenceDetail?.mode === "nthWeekday"
+        ? "nthWeekday"
+        : eventRecurrenceDetail?.mode === "range"
+          ? "range"
+          : "dayOfMonth"
+  );
+  const [monthlyDayOfMonth, setMonthlyDayOfMonth] = useState<number>(
+    () => Number(eventRecurrenceDetail?.dayOfMonth ?? dayjs(startDayInit).date())
+  );
+  const [monthlyWeekNo, setMonthlyWeekNo] = useState<number>(
+    () => Number(eventRecurrenceDetail?.weekNo ?? Math.ceil(dayjs(startDayInit).date() / 7))
+  );
+  const [monthlyWeekday, setMonthlyWeekday] = useState<number>(
+    () => Number(eventRecurrenceDetail?.weekday ?? dayjs(startDayInit).isoWeekday())
+  );
+  const [monthlyRangeStartDay, setMonthlyRangeStartDay] = useState<number>(
+    () => Number(eventRecurrenceDetail?.startDay ?? dayjs(startDayInit).date())
+  );
+  const [monthlyRangeEndDay, setMonthlyRangeEndDay] = useState<number>(
+    () => Number(eventRecurrenceDetail?.endDay ?? dayjs(endDayInit).date())
+  );
+  const [yearlyMode, setYearlyMode] = useState<"dayOfYear" | "range">(
+    () => (eventRecurrenceDetail?.mode === "yearRange" ? "range" : "dayOfYear")
+  );
+  const [yearlyMonth, setYearlyMonth] = useState<number>(
+    () => Number(eventRecurrenceDetail?.month ?? dayjs(startDayInit).month() + 1)
+  );
+  const [yearlyDay, setYearlyDay] = useState<number>(
+    () => Number(eventRecurrenceDetail?.day ?? dayjs(startDayInit).date())
+  );
+  const [yearlyRangeStartMonth, setYearlyRangeStartMonth] = useState<number>(
+    () => Number(eventRecurrenceDetail?.startMonth ?? dayjs(startDayInit).month() + 1)
+  );
+  const [yearlyRangeStartDay, setYearlyRangeStartDay] = useState<number>(
+    () => Number(eventRecurrenceDetail?.startDay ?? dayjs(startDayInit).date())
+  );
+  const [yearlyRangeEndMonth, setYearlyRangeEndMonth] = useState<number>(
+    () => Number(eventRecurrenceDetail?.endMonth ?? dayjs(endDayInit).month() + 1)
+  );
+  const [yearlyRangeEndDay, setYearlyRangeEndDay] = useState<number>(
+    () => Number(eventRecurrenceDetail?.endDay ?? dayjs(endDayInit).date())
+  );
+  const [recurrenceUpdateScope] = useState<"single" | "group">("group");
   const [kind, setKind] = useState<CalendarKind>(() => event?.kind ?? "personal");
   const [attendeeIds, setAttendeeIds] = useState<Set<string>>(
     () => new Set(event?.attendeeUserIds ?? [])
@@ -1618,23 +2114,64 @@ function EventFormModal({
       .slice(0, 80);
   }, [attendeeQuery, defaultDepartmentId, users]);
 
-  /** 생성: 항상 시작·종료 일자 선택 가능. 편집: 달력상 여러 날인 일정만 종료 일자 필드 표시 */
-  const showEndDate =
-    mode === "create"
-      ? true
-      : Boolean(
-          event &&
-            dayjs(event.endsAt).format("YYYY-MM-DD") !== dayjs(event.startsAt).format("YYYY-MM-DD")
-        );
+  /** 생성/수정 모두 시작·종료 일자 수정 가능 */
+  const showEndDate = true;
 
-  type FieldKey = "title" | "date" | "endDate" | "start" | "end" | "range" | "dept";
+  type FieldKey = "title" | "date" | "endDate" | "start" | "end" | "range" | "dept" | "repeat" | "repeatStart";
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<FieldKey, string>>>({});
+
+  useEffect(() => {
+    if (!showRecurrencePanel) return;
+    if (recurrenceEndDate && recurrenceEndDate.trim().length > 0) return;
+    setRecurrenceEndDate(dateStr);
+  }, [showRecurrencePanel, recurrenceEndDate, dateStr]);
+
+  useEffect(() => {
+    if (!showRecurrencePanel) return;
+    if (recurrenceType !== "daily" && recurrenceType !== "weekly" && recurrenceType !== "weekday") return;
+    if (!recurrenceEndDate) return;
+    setDateStr(recurrenceStartDate || dateStr);
+    setEndDateStr(recurrenceEndDate);
+  }, [showRecurrencePanel, recurrenceType, recurrenceEndDate]);
 
   function buildPayload(): Record<string, unknown> {
     const [sh, sm] = startT.split(":").map(Number);
     const [eh, em] = endT.split(":").map(Number);
-    const startsAt = dayjs(dateStr).hour(sh).minute(sm).second(0).millisecond(0).toISOString();
-    const endsAt = dayjs(endDateStr).hour(eh).minute(em).second(0).millisecond(0).toISOString();
+    const effectiveRecurrenceType =
+      showRecurrencePanel && recurrenceType === "none" ? "daily" : recurrenceType;
+    const isContinuousRepeat =
+      showRecurrencePanel &&
+      (effectiveRecurrenceType === "daily" ||
+        effectiveRecurrenceType === "weekly" ||
+        effectiveRecurrenceType === "weekday");
+    const repeatStartBaseDate = recurrenceStartDate || dateStr;
+    const normalizedRecurrenceEndDate =
+      recurrenceEndDate && recurrenceEndDate.trim().length > 0 ? recurrenceEndDate : repeatStartBaseDate;
+    let startDateForPayload = showRecurrencePanel ? repeatStartBaseDate : dateStr;
+    if (showRecurrencePanel && effectiveRecurrenceType === "monthly" && monthlyMode === "range") {
+      startDateForPayload = dayjs(repeatStartBaseDate).date(Math.max(1, Math.min(31, monthlyRangeStartDay))).format("YYYY-MM-DD");
+    }
+    if (showRecurrencePanel && effectiveRecurrenceType === "yearly" && yearlyMode === "range") {
+      const y = dayjs(repeatStartBaseDate).year();
+      startDateForPayload = dayjs(`${y}-01-01`)
+        .month(Math.max(1, Math.min(12, yearlyRangeStartMonth)) - 1)
+        .date(Math.max(1, Math.min(31, yearlyRangeStartDay)))
+        .format("YYYY-MM-DD");
+    }
+    const endDateForPayload = showRecurrencePanel
+      ? isContinuousRepeat
+        ? repeatStartBaseDate
+        : effectiveRecurrenceType === "monthly" && monthlyMode === "range"
+          ? dayjs(startDateForPayload).date(Math.max(1, Math.min(31, monthlyRangeEndDay))).format("YYYY-MM-DD")
+          : effectiveRecurrenceType === "yearly" && yearlyMode === "range"
+            ? dayjs(startDateForPayload)
+                .month(Math.max(1, Math.min(12, yearlyRangeEndMonth)) - 1)
+                .date(Math.max(1, Math.min(31, yearlyRangeEndDay)))
+                .format("YYYY-MM-DD")
+            : repeatStartBaseDate
+      : endDateStr || dateStr;
+    const startsAt = dayjs(startDateForPayload).hour(sh).minute(sm).second(0).millisecond(0).toISOString();
+    const endsAt = dayjs(endDateForPayload).hour(eh).minute(em).second(0).millisecond(0).toISOString();
     const payload: Record<string, unknown> = {
       title: title.trim(),
       description: description.trim() || null,
@@ -1646,6 +2183,60 @@ function EventFormModal({
     };
     if (kind === "team") {
       payload.departmentId = teamDeptId || null;
+    }
+    if (mode === "edit" && (event?.recurrenceType ?? "none") !== "none") {
+      payload.updateScope = recurrenceUpdateScope;
+    }
+    if (showRecurrencePanel && effectiveRecurrenceType !== "none") {
+      payload.recurrenceType = effectiveRecurrenceType;
+      payload.recurrenceEndDate = normalizedRecurrenceEndDate;
+      payload.recurrenceStartDate = repeatStartBaseDate;
+      const anchorStartDate = repeatStartBaseDate;
+      if (effectiveRecurrenceType === "weekly") {
+        payload.recurrenceDays = recurrenceDays;
+      }
+      if (effectiveRecurrenceType === "monthly") {
+        payload.recurrenceDetail =
+          monthlyMode === "nthWeekday"
+            ? {
+                mode: "nthWeekday",
+                weekNo: monthlyWeekNo,
+                weekday: monthlyWeekday,
+                anchorStartDate
+              }
+            : monthlyMode === "range"
+              ? {
+                  mode: "range",
+                  startDay: monthlyRangeStartDay,
+                  endDay: monthlyRangeEndDay,
+                  dayOfMonth: monthlyRangeStartDay,
+                  anchorStartDate
+                }
+            : {
+                mode: "dayOfMonth",
+                dayOfMonth: monthlyDayOfMonth,
+                anchorStartDate
+              };
+      } else if (effectiveRecurrenceType === "yearly") {
+        payload.recurrenceDetail =
+          yearlyMode === "range"
+            ? {
+                mode: "yearRange",
+                startMonth: yearlyRangeStartMonth,
+                startDay: yearlyRangeStartDay,
+                endMonth: yearlyRangeEndMonth,
+                endDay: yearlyRangeEndDay,
+                month: yearlyRangeStartMonth,
+                day: yearlyRangeStartDay,
+                anchorStartDate
+              }
+            : { mode: "dayOfYear", month: yearlyMonth, day: yearlyDay, anchorStartDate };
+      } else {
+        payload.recurrenceDetail = { anchorStartDate };
+      }
+    } else {
+      /** null/빈 배열을 보내면 Zod(.optional())에서 거부되므로 비반복 시 반복 필드 생략 */
+      payload.recurrenceType = "none";
     }
     return payload;
   }
@@ -1659,18 +2250,48 @@ function EventFormModal({
           const next: Partial<Record<FieldKey, string>> = {};
           if (!title.trim()) next.title = "제목을 입력해 주세요.";
           if (!dateStr) next.date = "날짜를 선택해 주세요.";
-          if (showEndDate && !endDateStr) next.endDate = "종료 날짜를 선택해 주세요.";
-          if (showEndDate && endDateStr && dateStr && endDateStr < dateStr) {
+          if (!showRecurrencePanel && showEndDate && !endDateStr) next.endDate = "종료 날짜를 선택해 주세요.";
+          if (!showRecurrencePanel && showEndDate && endDateStr && dateStr && endDateStr < dateStr) {
             next.endDate = "종료 날짜는 시작 날짜 이후여야 합니다.";
           }
           if (!startT) next.start = "시작 시간을 선택해 주세요.";
           if (!endT) next.end = "종료 시간을 선택해 주세요.";
+          if (showRecurrencePanel && recurrenceType !== "none") {
+            const repeatBaseStart = recurrenceStartDate || dateStr;
+            if (!recurrenceEndDate) {
+              next.repeat = "반복 종료일을 선택해 주세요.";
+            } else if (!recurrenceStartDate) {
+              next.repeatStart = "반복 시작일을 선택해 주세요.";
+            } else if (recurrenceEndDate < repeatBaseStart) {
+              next.repeat = "반복 종료일은 시작일 이후여야 합니다.";
+            } else if (recurrenceType === "monthly" && monthlyMode === "range" && monthlyRangeEndDay < monthlyRangeStartDay) {
+              next.endDate = "시작일~종료일의 일 범위가 올바르지 않습니다.";
+            } else if (
+              recurrenceType === "yearly" &&
+              yearlyMode === "range" &&
+              dayjs(`2000-${String(yearlyRangeEndMonth).padStart(2, "0")}-${String(yearlyRangeEndDay).padStart(2, "0")}`).isBefore(
+                dayjs(`2000-${String(yearlyRangeStartMonth).padStart(2, "0")}-${String(yearlyRangeStartDay).padStart(2, "0")}`)
+              )
+            ) {
+              next.endDate = "시작일~종료일의 월/일 범위가 올바르지 않습니다.";
+            } else if (recurrenceType === "weekly" && recurrenceDays.length === 0) {
+              next.repeat = "매주 반복은 최소 1개 요일을 선택해 주세요.";
+            }
+          }
           setFieldErrors(next);
           if (Object.keys(next).length > 0) return;
 
           const payload = buildPayload();
+          console.info("[EventFormModal] recurrence state before submit", {
+            showRecurrencePanel,
+            recurrenceType,
+            recurrenceStartDate,
+            recurrenceEndDate,
+            dateStr
+          });
+          const endDateForValidation = endDateStr || dateStr;
           const sDt = dayjs(dateStr).hour(Number(startT.split(":")[0])).minute(Number(startT.split(":")[1]));
-          const eDt = dayjs(endDateStr).hour(Number(endT.split(":")[0])).minute(Number(endT.split(":")[1]));
+          const eDt = dayjs(endDateForValidation).hour(Number(endT.split(":")[0])).minute(Number(endT.split(":")[1]));
           if (!eDt.isAfter(sDt)) {
             setFieldErrors({ range: "종료 시각은 시작 시각보다 늦어야 합니다." });
             return;
@@ -1680,6 +2301,7 @@ function EventFormModal({
             return;
           }
           setFieldErrors({});
+          console.info("[EventFormModal] submit payload", payload);
           onSubmit(payload);
         }}
       >
@@ -1697,80 +2319,352 @@ function EventFormModal({
           />
           {fieldErrors.title && <p className="mt-1 text-xs text-red-600">{fieldErrors.title}</p>}
         </label>
-        <label className="block">
-          <span className="text-xs font-semibold text-slate-500">{showEndDate ? "시작 날짜" : "날짜"}</span>
-          <input
-            type="date"
-            className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
-              fieldErrors.date ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
-            }`}
-            value={dateStr}
-            onChange={(e) => {
-              const v = e.target.value;
-              setDateStr(v);
-              if (!showEndDate) setEndDateStr(v);
-              setFieldErrors((f) => ({ ...f, date: undefined, endDate: undefined, range: undefined }));
-            }}
-          />
-          {fieldErrors.date && <p className="mt-1 text-xs text-red-600">{fieldErrors.date}</p>}
-        </label>
-        {showEndDate ? (
-          <label className="block">
-            <span className="text-xs font-semibold text-slate-500">종료 날짜</span>
-            <input
-              type="date"
-              className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
-                fieldErrors.endDate ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
-              }`}
-              value={endDateStr}
-              min={dateStr}
-              onChange={(e) => {
-                setEndDateStr(e.target.value);
-                setFieldErrors((f) => ({ ...f, endDate: undefined, range: undefined }));
+        <div className="rounded-lg border border-slate-200 p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-xs font-semibold text-slate-500">일시</span>
+            <button
+              type="button"
+              className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+              onClick={() => {
+                setShowRecurrencePanel((v) => {
+                  const next = !v;
+                  if (next && recurrenceType === "none") {
+                    setRecurrenceType("daily");
+                  }
+                  return next;
+                });
+                setFieldErrors((f) => ({ ...f, repeat: undefined }));
               }}
-            />
-            {fieldErrors.endDate && <p className="mt-1 text-xs text-red-600">{fieldErrors.endDate}</p>}
-          </label>
-        ) : null}
-        <div className="grid grid-cols-2 gap-3">
-          <label className="block">
-            <span className="text-xs font-semibold text-slate-500">시작</span>
-            <input
-              type="time"
-              step={900}
-              className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
-                fieldErrors.start ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
-              }`}
-              value={startT}
-              onChange={(e) => {
-                setStartT(e.target.value);
-                setFieldErrors((f) => ({ ...f, start: undefined, range: undefined }));
-              }}
-            />
-            {fieldErrors.start && <p className="mt-1 text-xs text-red-600">{fieldErrors.start}</p>}
-          </label>
-          <label className="block">
-            <span className="text-xs font-semibold text-slate-500">종료</span>
-            <input
-              type="time"
-              step={900}
-              className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
-                fieldErrors.end ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
-              }`}
-              value={endT}
-              onChange={(e) => {
-                setEndT(e.target.value);
-                setFieldErrors((f) => ({ ...f, end: undefined, range: undefined }));
-              }}
-            />
-            {fieldErrors.end && <p className="mt-1 text-xs text-red-600">{fieldErrors.end}</p>}
-          </label>
+            >
+              {showRecurrencePanel ? "반복 해제" : "반복"}
+            </button>
+          </div>
+          {!showRecurrencePanel ? (
+            <div className="space-y-3">
+              <label className="block">
+                <span className="text-xs font-semibold text-slate-500">{showEndDate ? "시작 날짜" : "날짜"}</span>
+                <input
+                  type="date"
+                  className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
+                    fieldErrors.date ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
+                  }`}
+                  value={dateStr}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setDateStr(v);
+                    if (!showEndDate) setEndDateStr(v);
+                    setFieldErrors((f) => ({ ...f, date: undefined, endDate: undefined, range: undefined }));
+                  }}
+                />
+                {fieldErrors.date && <p className="mt-1 text-xs text-red-600">{fieldErrors.date}</p>}
+              </label>
+              <label className="block">
+                <span className="text-xs font-semibold text-slate-500">종료 날짜</span>
+                <input
+                  type="date"
+                  className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
+                    fieldErrors.endDate ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
+                  }`}
+                  value={endDateStr}
+                  min={dateStr}
+                  onChange={(e) => {
+                    setEndDateStr(e.target.value);
+                    setFieldErrors((f) => ({ ...f, endDate: undefined, range: undefined }));
+                  }}
+                />
+                {fieldErrors.endDate && <p className="mt-1 text-xs text-red-600">{fieldErrors.endDate}</p>}
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-500">시작</span>
+                  <input
+                    type="time"
+                    step={900}
+                    className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
+                      fieldErrors.start ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
+                    }`}
+                    value={startT}
+                    onChange={(e) => {
+                      setStartT(e.target.value);
+                      setFieldErrors((f) => ({ ...f, start: undefined, range: undefined }));
+                    }}
+                  />
+                  {fieldErrors.start && <p className="mt-1 text-xs text-red-600">{fieldErrors.start}</p>}
+                </label>
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-500">종료</span>
+                  <input
+                    type="time"
+                    step={900}
+                    className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
+                      fieldErrors.end ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
+                    }`}
+                    value={endT}
+                    onChange={(e) => {
+                      setEndT(e.target.value);
+                      setFieldErrors((f) => ({ ...f, end: undefined, range: undefined }));
+                    }}
+                  />
+                  {fieldErrors.end && <p className="mt-1 text-xs text-red-600">{fieldErrors.end}</p>}
+                </label>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <label className="block">
+                <span className="text-xs font-semibold text-slate-500">반복 주기</span>
+                <select
+                  className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                  value={recurrenceType}
+                  onChange={(e) =>
+                    setRecurrenceType(
+                      e.target.value as "none" | "daily" | "weekly" | "weekday" | "monthly" | "yearly"
+                    )
+                  }
+                >
+                  {Object.entries(RECURRENCE_LABEL)
+                    .filter(([k]) => k !== "none")
+                    .map(([k, label]) => (
+                      <option key={k} value={k}>
+                        {label}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              {recurrenceType === "weekly" ? (
+                <div>
+                  <span className="text-xs font-semibold text-slate-500">요일</span>
+                  <div className="mt-1 flex flex-wrap gap-2">
+                    {WEEKDAYS.map((d, idx) => {
+                      const val = idx + 1;
+                      const checked = recurrenceDays.includes(val);
+                      return (
+                        <label key={d} className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-xs">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) =>
+                              setRecurrenceDays((prev) =>
+                                e.target.checked ? [...new Set([...prev, val])] : prev.filter((n) => n !== val)
+                              )
+                            }
+                          />
+                          {d}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+              <label className="block">
+                <span className="text-xs font-semibold text-slate-500">반복 시작일</span>
+                <input
+                  type="date"
+                  className={`mt-1 w-full rounded-lg border px-3 py-2 text-sm ${
+                    fieldErrors.repeatStart ? "border-red-300 ring-1 ring-red-200" : "border-slate-200"
+                  }`}
+                  value={recurrenceStartDate}
+                  onChange={(e) => {
+                    setRecurrenceStartDate(e.target.value);
+                    setFieldErrors((f) => ({ ...f, repeatStart: undefined, repeat: undefined, endDate: undefined }));
+                  }}
+                />
+                {fieldErrors.repeatStart ? <p className="mt-1 text-xs text-red-600">{fieldErrors.repeatStart}</p> : null}
+              </label>
+              {recurrenceType === "daily" || recurrenceType === "weekly" || recurrenceType === "weekday" ? (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                  반복 1회의 종료 날짜는 반복 종료일과 동일하게 자동 설정됩니다.
+                </div>
+              ) : null}
+              {recurrenceType === "monthly" ? (
+                <div className="grid grid-cols-3 gap-2">
+                  <select
+                    className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                    value={monthlyMode}
+                    onChange={(e) => setMonthlyMode(e.target.value as "dayOfMonth" | "nthWeekday" | "range")}
+                  >
+                    <option value="dayOfMonth">매월 n일</option>
+                    <option value="nthWeekday">매월 n번째 요일</option>
+                    <option value="range">시작일~종료일(n~n)</option>
+                  </select>
+                  {monthlyMode === "dayOfMonth" ? (
+                    <input
+                      type="number"
+                      min={1}
+                      max={31}
+                      className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                      value={monthlyDayOfMonth}
+                      onChange={(e) => setMonthlyDayOfMonth(Number(e.target.value || 1))}
+                    />
+                  ) : monthlyMode === "nthWeekday" ? (
+                    <>
+                      <select
+                        className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                        value={monthlyWeekNo}
+                        onChange={(e) => setMonthlyWeekNo(Number(e.target.value))}
+                      >
+                        {[1, 2, 3, 4, 5].map((n) => (
+                          <option key={n} value={n}>{n}번째</option>
+                        ))}
+                      </select>
+                      <select
+                        className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                        value={monthlyWeekday}
+                        onChange={(e) => setMonthlyWeekday(Number(e.target.value))}
+                      >
+                        {WEEKDAYS.map((d, idx) => (
+                          <option key={d} value={idx + 1}>{d}</option>
+                        ))}
+                      </select>
+                    </>
+                  ) : (
+                    <>
+                      <input
+                        type="number"
+                        min={1}
+                        max={31}
+                        className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                        value={monthlyRangeStartDay}
+                        onChange={(e) => setMonthlyRangeStartDay(Number(e.target.value || 1))}
+                      />
+                      <input
+                        type="number"
+                        min={1}
+                        max={31}
+                        className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                        value={monthlyRangeEndDay}
+                        onChange={(e) => setMonthlyRangeEndDay(Number(e.target.value || 1))}
+                      />
+                    </>
+                  )}
+                </div>
+              ) : null}
+              {recurrenceType === "yearly" ? (
+                <div className="grid grid-cols-3 gap-2">
+                  <select
+                    className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                    value={yearlyMode}
+                    onChange={(e) => setYearlyMode(e.target.value as "dayOfYear" | "range")}
+                  >
+                    <option value="dayOfYear">매년 m월 n일</option>
+                    <option value="range">시작일~종료일(mm-dd~mm-dd)</option>
+                  </select>
+                  {yearlyMode === "dayOfYear" ? (
+                    <>
+                      <input
+                        type="number"
+                        min={1}
+                        max={12}
+                        className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                        value={yearlyMonth}
+                        onChange={(e) => setYearlyMonth(Number(e.target.value || 1))}
+                      />
+                      <input
+                        type="number"
+                        min={1}
+                        max={31}
+                        className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                        value={yearlyDay}
+                        onChange={(e) => setYearlyDay(Number(e.target.value || 1))}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <input
+                        type="text"
+                        readOnly
+                        className="rounded-lg border border-slate-200 px-2 py-2 text-xs"
+                        value={`${yearlyRangeStartMonth}-${yearlyRangeStartDay} ~ ${yearlyRangeEndMonth}-${yearlyRangeEndDay}`}
+                      />
+                      <div className="grid grid-cols-2 gap-1">
+                        <input
+                          type="number"
+                          min={1}
+                          max={12}
+                          className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                          value={yearlyRangeStartMonth}
+                          onChange={(e) => setYearlyRangeStartMonth(Number(e.target.value || 1))}
+                        />
+                        <input
+                          type="number"
+                          min={1}
+                          max={31}
+                          className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                          value={yearlyRangeStartDay}
+                          onChange={(e) => setYearlyRangeStartDay(Number(e.target.value || 1))}
+                        />
+                      </div>
+                      <div className="grid grid-cols-2 gap-1">
+                        <input
+                          type="number"
+                          min={1}
+                          max={12}
+                          className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                          value={yearlyRangeEndMonth}
+                          onChange={(e) => setYearlyRangeEndMonth(Number(e.target.value || 1))}
+                        />
+                        <input
+                          type="number"
+                          min={1}
+                          max={31}
+                          className="rounded-lg border border-slate-200 px-2 py-2 text-sm"
+                          value={yearlyRangeEndDay}
+                          onChange={(e) => setYearlyRangeEndDay(Number(e.target.value || 1))}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : null}
+              <label className="block">
+                <span className="text-xs font-semibold text-slate-500">반복 종료일 (~까지 반복)</span>
+                <input
+                  type="date"
+                  className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                  value={recurrenceEndDate}
+                  min={recurrenceStartDate || dateStr}
+                  onChange={(e) => {
+                    setRecurrenceEndDate(e.target.value);
+                    setFieldErrors((f) => ({ ...f, repeat: undefined }));
+                  }}
+                />
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-500">시작 시간</span>
+                  <input
+                    type="time"
+                    step={900}
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    value={startT}
+                    onChange={(e) => setStartT(e.target.value)}
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-500">종료 시간</span>
+                  <input
+                    type="time"
+                    step={900}
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    value={endT}
+                    onChange={(e) => setEndT(e.target.value)}
+                  />
+                </label>
+              </div>
+              {fieldErrors.repeat ? <p className="text-xs text-red-600">{fieldErrors.repeat}</p> : null}
+            </div>
+          )}
         </div>
         {fieldErrors.range && (
           <p className="text-sm text-red-600" role="alert">
             {fieldErrors.range}
           </p>
         )}
+        {mode === "edit" && (event?.recurrenceType ?? "none") !== "none" ? (
+          <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            반복 일정 저장 시 기존 그룹을 삭제한 뒤 수정 내용으로 재등록합니다.
+          </p>
+        ) : null}
         <label className="block">
           <span className="text-xs font-semibold text-slate-500">구분</span>
           <select

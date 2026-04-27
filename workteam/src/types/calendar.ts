@@ -15,6 +15,11 @@ export type CalendarEvent = {
   createdByUser: { name: string; departmentName: string | null } | null;
   createdAt: string;
   updatedAt: string;
+  recurrenceType?: "none" | "daily" | "weekly" | "weekday" | "monthly" | "yearly";
+  recurrenceDays?: string | null;
+  recurrenceEndDate?: string | null;
+  recurrenceDetail?: Record<string, unknown> | null;
+  recurrenceGroupId?: string | null;
 };
 
 export const KIND_LABEL: Record<CalendarKind, string> = {

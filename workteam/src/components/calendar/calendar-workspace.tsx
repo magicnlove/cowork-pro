@@ -18,7 +18,7 @@ import isoWeek from "dayjs/plugin/isoWeek";
 import { ReactNode, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { fetchJson } from "@/lib/fetch-json";
 import { markNavBadgeRead } from "@/lib/nav-badge-read";
-import { buildKoreanHolidayMap } from "@/lib/holiday-kr";
+import { KOREAN_HOLIDAY_MAP_2024_2040 } from "@/lib/holiday-kr";
 import type { UserOption } from "@/types/tasks";
 import {
   KIND_LABEL,
@@ -1056,10 +1056,9 @@ export function CalendarWorkspace() {
     const start = cursor.startOf("isoWeek");
     return Array.from({ length: 7 }, (_, i) => start.add(i, "day"));
   }, [cursor]);
-  const holidayMap = useMemo(() => buildKoreanHolidayMap(2024, 2040), []);
   const getHolidayName = useCallback(
-    (d: dayjs.Dayjs) => holidayMap.get(d.format("YYYY-MM-DD")) ?? null,
-    [holidayMap]
+    (d: dayjs.Dayjs) => KOREAN_HOLIDAY_MAP_2024_2040.get(d.format("YYYY-MM-DD")) ?? null,
+    []
   );
   const isWeekend = useCallback((d: dayjs.Dayjs) => {
     const wd = d.day();

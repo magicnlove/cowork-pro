@@ -69,3 +69,6 @@ export function buildKoreanHolidayMap(startYear = 2024, endYear = 2040): Holiday
   return out;
 }
 
+// Precompute once at module load to avoid repeated expensive lunar-date scanning.
+export const KOREAN_HOLIDAY_MAP_2024_2040: ReadonlyMap<string, string> = buildKoreanHolidayMap(2024, 2040);
+
